@@ -160,10 +160,16 @@ static void handle_poll(const cfg_t *c, const radio_rx_t *rx)
 
     app_stats()->resp_tx++;
 
+    /* The nominal Final instant is an RMARKER, but radio_rx() does not return
+     * until the whole frame has arrived, so the Final's own air time has to be
+     * inside the deadline. Without it, at 110 kbps the Final needs ~3.9 ms of
+     * air after its RMARKER against a 900 us rx_timeout_us, so every exchange
+     * was reaped before its Final could land and DS-TWR never completed. */
     m_ex[k].deadline_hi32 = (uint32_t)(rx->rx_ts >> 8)
                           + us_to_hi32(c->resp_base_us
                                        + (uint32_t)c->resp_count * c->resp_pitch_us
-                                       + c->rx_timeout_us);
+                                       + c->rx_timeout_us)
+                          + ns_to_hi32(timing_air_final_ns(c));
 
     m_ex[k].armed      = true;
     m_ex[k].src        = src;

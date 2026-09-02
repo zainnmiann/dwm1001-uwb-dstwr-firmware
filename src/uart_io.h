@@ -42,4 +42,7 @@ uint32_t uart_io_dropped(void);
 /** Poll for a completed input line. Returns NULL until '\n' or '\r' arrives. */
 char    *uart_io_poll_line(void);
 
+/** Number of received bytes lost because the RX FIFO was full. */
+uint32_t uart_io_rx_dropped(void);
+
 #endif /* UART_IO_H_ */

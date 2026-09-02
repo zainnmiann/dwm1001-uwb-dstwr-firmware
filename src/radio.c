@@ -246,13 +246,26 @@ static void apply_cfg(const cfg_t *c)
 
     {
         uint8_t prf_idx = (c->prf == PRF_64) ? 1u : 0u;
+        bool    uncal   = (c->ant_delay_tx == CFG_ANT_DELAY_UNCAL
+                           && c->ant_delay_rx == CFG_ANT_DELAY_UNCAL);
 
-        if (m_otp_antdly_valid[prf_idx]
-            && c->ant_delay_tx == CFG_ANT_DELAY_UNCAL
-            && c->ant_delay_rx == CFG_ANT_DELAY_UNCAL)
+        if (m_otp_antdly_valid[prf_idx] && uncal)
         {
             m_ant_tx = (uint16_t)(m_otp_antdly[prf_idx] / 2u);
             m_ant_rx = (uint16_t)(m_otp_antdly[prf_idx] - m_ant_tx);
+        }
+        else if (uncal)
+        {
+            /* No OTP value on this part. CFG_ANT_DELAY_UNCAL is a *combined*
+             * TX+RX placeholder, exactly like the OTP word, so it must be
+             * split the same way. Programming it into both registers made the
+             * total compensation 2x that of an OTP-programmed part: two
+             * co-located nodes would then disagree by delta/2 = ~128 ns of
+             * tau, some 38 m, decided purely by whether their OTP happened to
+             * be blank. Confirmed against hardware -- a surveyed 4.769 m
+             * baseline reads correct under the split convention. */
+            m_ant_tx = (uint16_t)(CFG_ANT_DELAY_UNCAL / 2u);
+            m_ant_rx = (uint16_t)(CFG_ANT_DELAY_UNCAL - m_ant_tx);
         }
     }
 

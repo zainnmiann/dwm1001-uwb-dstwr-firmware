@@ -141,6 +141,12 @@ void out_range(const rng_record_t *r)
     {
         uint8_t p[25];
         uint32_t o = 0;
+        /* Suppressed the same way as the text formats. Packing them regardless
+         * made out_mask's meaning depend on out_format, which neither the mask
+         * bits nor section 9.4 describe. */
+        bool     diag = (c->out_mask & OUT_MASK_DIAG) != 0u;
+        int16_t  rxp  = diag ? r->rxp_dbm10 : 0;
+        int16_t  fpp  = diag ? r->fpp_dbm10 : 0;
         p[o++] = (uint8_t)r->sfn;        p[o++] = (uint8_t)(r->sfn >> 8);
         p[o++] = r->frame_idx;
         p[o++] = (uint8_t)r->tag_id;     p[o++] = (uint8_t)(r->tag_id >> 8);
@@ -150,8 +156,8 @@ void out_range(const rng_record_t *r)
         p[o++] = (uint8_t)(r->d_mm >> 16); p[o++] = (uint8_t)(r->d_mm >> 24);
         p[o++] = (uint8_t)r->tof_ps;     p[o++] = (uint8_t)(r->tof_ps >> 8);
         p[o++] = (uint8_t)(r->tof_ps >> 16); p[o++] = (uint8_t)(r->tof_ps >> 24);
-        p[o++] = (uint8_t)r->rxp_dbm10;  p[o++] = (uint8_t)(r->rxp_dbm10 >> 8);
-        p[o++] = (uint8_t)r->fpp_dbm10;  p[o++] = (uint8_t)(r->fpp_dbm10 >> 8);
+        p[o++] = (uint8_t)rxp;           p[o++] = (uint8_t)(rxp >> 8);
+        p[o++] = (uint8_t)fpp;           p[o++] = (uint8_t)(fpp >> 8);
         p[o++] = r->flags;
         p[o++] = (uint8_t)r->t_local_us; p[o++] = (uint8_t)(r->t_local_us >> 8);
         p[o++] = (uint8_t)(r->t_local_us >> 16); p[o++] = (uint8_t)(r->t_local_us >> 24);

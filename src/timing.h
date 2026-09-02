@@ -69,6 +69,11 @@ uint32_t timing_len_report(const cfg_t *c);
  * measured column ... and all later tables are derived from the measured
  * values", so a non-zero measured override wins over the model.
  */
+/** Duration of the preamble + SFD, i.e. everything before the RX RMARKER. */
+uint32_t timing_shr_ns(const cfg_t *c);
+/** Everything after the RMARKER: PHR + payload. @p air_ns is a timing_air_*. */
+uint32_t timing_tail_ns(const cfg_t *c, uint32_t air_ns);
+
 uint32_t timing_air_poll_ns(const cfg_t *c);
 uint32_t timing_air_resp_ns(const cfg_t *c);
 uint32_t timing_air_final_ns(const cfg_t *c);

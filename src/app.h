@@ -72,6 +72,11 @@ bool     app_ranging(void);
 void     app_ranging_set(bool on);
 
 /** Current sync state, for $STAT on an initiator. */
+/** Ask the role loop to drop back to COLD and re-acquire (see $RANGE,START). */
+void     app_request_resync(void);
+/** Consume a pending resync request. */
+bool     app_take_resync(void);
+
 const sync_t *app_sync(void);
 
 /** Section 10.1 / 10.2 / listener. None of these return. */

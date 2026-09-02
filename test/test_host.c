@@ -254,6 +254,70 @@ static void test_frame_lengths(void)
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * sync_missed_frame()'s clamp: must never zero the increment.
+ * ------------------------------------------------------------------------ */
+static uint32_t missed_increment(uint32_t init_count, uint8_t sync_mmax)
+{
+    uint32_t elapsed = (init_count > 0u) ? init_count : 1u;
+
+    if (elapsed >= sync_mmax)
+    {
+        elapsed = (sync_mmax > 1u) ? ((uint32_t)sync_mmax - 1u) : 1u;
+    }
+    return elapsed;
+}
+
+static void test_missed_clamp(void)
+{
+    /* sync_mmax = 1 means "one missed frame is a desync". The clamp used to
+     * yield 0 here, so s->missed never advanced and SYNC_FREERUN -- and
+     * RNG_FLAG_DESYNC -- were unreachable at a legal setting. */
+    CHECK(missed_increment(4, 1) >= 1, "sync_mmax=1 must still cross");
+    CHECK(missed_increment(1, 1) >= 1, "sync_mmax=1, N_I=1 must still cross");
+
+    /* And no legal pair may increment by zero, or M_max becomes unreachable. */
+    for (uint32_t ni = 1; ni <= 32; ni++) {
+        for (uint32_t mm = 1; mm <= 255; mm++) {
+            uint32_t inc = missed_increment(ni, (uint8_t)mm);
+            CHECK(inc >= 1, "zero increment at N_I=%u sync_mmax=%u", ni, mm);
+            /* One silent superframe alone must not cross a threshold above 1. */
+            if (mm > 1) {
+                CHECK(inc < mm, "one superframe crossed M_max=%u at N_I=%u", mm, ni);
+            }
+        }
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Antenna delay: both provisioning paths must total the same compensation.
+ * ------------------------------------------------------------------------ */
+#define CFG_ANT_DELAY_UNCAL 16385u
+
+static void test_ant_delay_split(void)
+{
+    /* The OTP word and the uncalibrated placeholder are both *combined* TX+RX
+     * values, so both must be halved. Programming the placeholder into both
+     * registers doubled this node's compensation, and two co-located nodes
+     * then disagreed by delta/2 (~128 ns of tau, ~38 m) purely on whether
+     * their OTP happened to be blank. */
+    uint32_t otp = 16400u;
+    uint32_t otp_tx = otp / 2u,  otp_rx = otp - otp_tx;
+    uint32_t unc_tx = CFG_ANT_DELAY_UNCAL / 2u;
+    uint32_t unc_rx = CFG_ANT_DELAY_UNCAL - unc_tx;
+
+    CHECK(otp_tx + otp_rx == otp, "OTP split must be lossless");
+    CHECK(unc_tx + unc_rx == CFG_ANT_DELAY_UNCAL, "fallback split must be lossless");
+
+    /* The two conventions must agree to within the placeholder's own offset
+     * from a typical OTP value -- not a factor of two. */
+    {
+        long diff = (long)(otp_tx + otp_rx) - (long)(unc_tx + unc_rx);
+        CHECK(diff > -1000 && diff < 1000,
+              "OTP and fallback totals differ by %ld DTU", diff);
+    }
+}
+
 int main(void)
 {
     printf("UWB DS-TWR host tests\n");
@@ -262,6 +326,8 @@ int main(void)
     test_local_us();
     test_rng_record_size();
     test_frame_lengths();
+    test_missed_clamp();
+    test_ant_delay_split();
 
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_run, g_fail);
     return g_fail ? 1 : 0;

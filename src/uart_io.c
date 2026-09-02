@@ -20,15 +20,27 @@ static volatile uint32_t m_tx_tail;      /* consumer (IRQ) */
 static volatile bool     m_tx_active;
 static volatile uint32_t m_dropped;
 
-/* Double buffered: the ISR fills m_rx_fill while the main loop parses the
- * buffer handed out by uart_io_poll_line(). serial_poll() writes NULs into
+/* RX is a byte FIFO, not a line buffer. The previous double-buffer scheme
+ * dropped every byte arriving while a completed line awaited pickup, and that
+ * window is a whole role-loop iteration wide -- one run_frame() spans the frame
+ * duration, 4 ms by default -- so a host writing "$RANGE,STOP\r\n$SET,...\r\n"
+ * in a single 921600 baud burst lost the second command entirely, with no error.
+ * m_head is written only by the ISR and m_tail only by the main loop, so the
+ * 32-bit aligned volatile accesses need no critical section.
+ *
+ * Legacy note: the main loop parses the line handed out by uart_io_poll_line().
+ * serial_poll() writes NULs into
  * that buffer while tokenizing, so a single shared buffer would let a second
  * command arriving in the same burst (routine at 921600) overwrite the one
  * being parsed. Volatile because the ISR is the sole writer of the indices. */
-static char              m_rx_buf[2][UART_RX_LINE_SZ];
-static volatile uint8_t  m_rx_fill;      /* buffer the ISR is filling  */
-static volatile uint32_t m_rx_len;
-static volatile bool     m_rx_ready;
+#define UART_RX_FIFO_SZ     256u
+
+static volatile uint8_t  m_fifo[UART_RX_FIFO_SZ];
+static volatile uint32_t m_head;         /* ISR writes            */
+static volatile uint32_t m_tail;         /* main loop reads       */
+static volatile uint32_t m_rx_dropped;   /* FIFO-full byte count  */
+static char              m_line[UART_RX_LINE_SZ];
+static uint32_t          m_line_len;     /* partial line, main loop only */
 
 /* The nRF52 UART takes a fixed register value per rate, so only the rates the
  * hardware actually enumerates are reachable. Returns 0 for anything else so
@@ -105,24 +117,19 @@ void UARTE0_UART0_IRQHandler(void)
         NRF_UART0->EVENTS_RXDRDY = 0;
         c = (uint8_t)NRF_UART0->RXD;
 
-        if (!m_rx_ready)
         {
-            if (c == '\n' || c == '\r')
+            uint32_t nh = m_head + 1u;
+
+            if (nh >= UART_RX_FIFO_SZ) { nh = 0u; }
+
+            if (nh != m_tail)
             {
-                m_rx_buf[m_rx_fill][m_rx_len] = '\0';
-                if (m_rx_len > 0u)
-                {
-                    m_rx_ready = true;      /* this buffer is now the caller's */
-                }
-                m_rx_len = 0;
-            }
-            else if (m_rx_len < (UART_RX_LINE_SZ - 1u))
-            {
-                m_rx_buf[m_rx_fill][m_rx_len++] = (char)c;
+                m_fifo[m_head] = c;
+                m_head         = nh;
             }
             else
             {
-                m_rx_len = 0;   /* overlong line: discard */
+                m_rx_dropped++;         /* FIFO full: the host is ahead of us */
             }
         }
     }
@@ -140,8 +147,10 @@ void uart_io_init(uint32_t baud)
     m_tx_tail   = 0;
     m_tx_active = false;
     m_dropped   = 0;
-    m_rx_len    = 0;
-    m_rx_ready  = false;
+    m_head       = 0;
+    m_tail       = 0;
+    m_line_len   = 0;
+    m_rx_dropped = 0;
 
     nrf_gpio_cfg_output(TX_PIN_NUMBER);
     nrf_gpio_pin_set(TX_PIN_NUMBER);
@@ -244,20 +253,38 @@ uint32_t uart_io_dropped(void)
 
 char *uart_io_poll_line(void)
 {
-    uint8_t done;
-
-    if (!m_rx_ready)
+    while (m_tail != m_head)
     {
-        return NULL;
+        uint8_t  c = m_fifo[m_tail];
+        uint32_t nt = m_tail + 1u;
+
+        if (nt >= UART_RX_FIFO_SZ) { nt = 0u; }
+        m_tail = nt;
+
+        if (c == '\n' || c == '\r')
+        {
+            if (m_line_len > 0u)
+            {
+                m_line[m_line_len] = '\0';
+                m_line_len = 0;
+                return m_line;          /* one command; the rest stay queued */
+            }
+            continue;                   /* bare CR/LF or CRLF pair */
+        }
+
+        if (m_line_len < (UART_RX_LINE_SZ - 1u))
+        {
+            m_line[m_line_len++] = (char)c;
+        }
+        else
+        {
+            m_line_len = 0;             /* overlong line: discard to terminator */
+        }
     }
+    return NULL;
+}
 
-    /* Hand the completed buffer to the caller and flip the ISR onto the other
-     * one before re-opening it, so a command arriving mid-parse cannot scribble
-     * over the line being tokenized. */
-    done      = m_rx_fill;
-    m_rx_fill = (uint8_t)(done ^ 1u);
-    m_rx_len  = 0;
-    m_rx_ready = false;
-
-    return m_rx_buf[done];
+uint32_t uart_io_rx_dropped(void)
+{
+    return m_rx_dropped;
 }
