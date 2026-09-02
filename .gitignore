@@ -1,0 +1,14 @@
+# Build output
+_build/
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+
+# Host test binary
+test/test_host
+
+# macOS
+.DS_Store
