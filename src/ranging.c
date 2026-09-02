@@ -32,14 +32,26 @@ int64_t ranging_tof_dtu(const twr_ts_t *ts)
     num = (rd1 * rd2) - (rp1 * rp2);
     den = rd1 + rd2 + rp1 + rp2;
 
+    /* Rejected before the division so the rounding below cannot lift a
+     * negative numerator into the plausible band. */
+    if (num < 0)
+    {
+        return -1;
+    }
+
     if (den <= 0)
     {
         return -3;
     }
 
-    num /= den;
+    /* Round to nearest, not toward zero. Truncating here cost on average half
+     * a device time unit, and one unit of tau is c * 15.650040 ps = 4.7 mm, so
+     * every reported range carried a systematic ~2.4 mm shortfall -- measured
+     * as a -3 mm mean bias by the host simulator, together with the two
+     * truncations further down the conversion chain. */
+    num = (num + den / 2) / den;
 
-    if (num < 0 || num > MAX_TAU_DTU)
+    if (num > MAX_TAU_DTU)
     {
         return -4;
     }
@@ -122,11 +134,12 @@ uint32_t ranging_dtu_to_ps(int64_t tau_dtu)
 int32_t ranging_ps_to_mm(uint32_t tau_ps, int32_t extra_dtu)
 {
     /* c in air is 299702547 m/s = 0.299702547 mm/ps. */
-    int64_t ps = (int64_t)tau_ps - ((int64_t)extra_dtu * 1565004LL) / 100000LL;
+    int64_t ps = (int64_t)tau_ps
+               - (((int64_t)extra_dtu * 1565004LL + 50000LL) / 100000LL);
 
     if (ps < 0)
     {
         ps = 0;
     }
-    return (int32_t)((ps * 299702547LL) / 1000000000LL);
+    return (int32_t)((ps * 299702547LL + 500000000LL) / 1000000000LL);
 }

@@ -129,8 +129,9 @@ static inline uint64_t us_to_dtu(uint32_t us)
 }
 static inline uint32_t dtu_to_ps(uint64_t dtu)
 {
-    /* 1 DTU = 15.650040 ps */
-    return (uint32_t)((dtu * 1565004ULL) / 100000ULL);
+    /* 1 DTU = 15.650040 ps, rounded to nearest -- truncating biased every
+     * converted tau low. */
+    return (uint32_t)((dtu * 1565004ULL + 50000ULL) / 100000ULL);
 }
 
 #endif /* TIMING_H_ */

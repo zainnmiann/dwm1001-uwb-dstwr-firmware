@@ -12,3 +12,6 @@ test/test_host
 
 # macOS
 .DS_Store
+
+# Simulator build output
+sim/sim
