@@ -83,6 +83,25 @@ uint32_t timing_air_ns(const cfg_t *c, uint32_t n_bytes)
 /* Actual message lengths of the current configuration (payload, no FCS --    */
 /* timing_air_ns adds the two FCS bytes itself).                              */
 
+uint32_t timing_shr_ns(const cfg_t *c)
+{
+    uint64_t t_psym = (c->prf == PRF_16) ? T_PSYM_PS_16 : T_PSYM_PS_64;
+
+    return (uint32_t)((((uint64_t)c->preamble_len + n_sfd(c)) * t_psym + 500ULL)
+                      / 1000ULL);
+}
+
+uint32_t timing_tail_ns(const cfg_t *c, uint32_t air_ns)
+{
+    uint32_t shr = timing_shr_ns(c);
+
+    /* Everything that arrives *after* the RX RMARKER: the PHR and the payload.
+     * All the delayed-TX instants of equations (1) and (3) are referenced to
+     * the RMARKER, but the frame is not fully received -- and the handler not
+     * yet running -- until this much later. */
+    return (air_ns > shr) ? (air_ns - shr) : 0u;
+}
+
 uint32_t timing_len_poll  (const cfg_t *c) { (void)c; return POLL_LEN   - FCS_LEN; }
 uint32_t timing_len_resp  (const cfg_t *c) { (void)c; return RESP_LEN   - FCS_LEN; }
 uint32_t timing_len_report(const cfg_t *c) { (void)c; return REPORT_LEN - FCS_LEN; }

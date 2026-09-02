@@ -13,6 +13,10 @@
 /** Speed of light in air, millimetres per second, as used for d = c*tau. */
 #define C_AIR_MM_PER_S      299702547000.0
 
+/* Plausibility ceiling on a time of flight, shared by the estimators and by
+ * the Report decoder: MAX_TAU_DTU (~1000 m) expressed in picoseconds. */
+#define RANGING_MAX_TOF_PS  3333500u
+
 /**
  * The four intervals of equations (4) and (5), in DW1000 device time units.
  *

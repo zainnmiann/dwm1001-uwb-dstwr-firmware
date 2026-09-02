@@ -282,7 +282,8 @@ static void cmd_stat(void)
                   (long)y->beta_ppb, (long)y->last_err_us,
                   (unsigned long)y->n_rearm, (unsigned long)y->n_freerun);
     }
-    out_linef("STAT,ranging,%u", app_ranging() ? 1u : 0u);
+    out_linef("STAT,ranging,%u,rx_dropped,%lu",
+              app_ranging() ? 1u : 0u, (unsigned long)uart_io_rx_dropped());
 }
 
 static void cmd_table_a(void)
@@ -487,6 +488,15 @@ static void dispatch(char *payload)
             key_format(k, out, sizeof(out));
             ok(key, out);
         }
+        /* uart_io_init() otherwise runs only at boot, so the console kept the
+         * old rate while $CFG and $GET reported the new one -- exactly the
+         * mismatch cfg_validate()'s baud check exists to prevent. The reply
+         * above goes out at the old rate, then the port moves. */
+        if (strcmp(key, "uart_baud") == 0)
+        {
+            uart_io_flush();
+            uart_io_init(cfg()->uart_baud);
+        }
         return;
     }
 
@@ -529,8 +539,22 @@ static void dispatch(char *payload)
 
     if (strcmp(cmd, "AUTOTIME") == 0)
     {
+        /* Table B is computed from proc/isr/margin, each legal up to 20000 us,
+         * so it can easily land outside the validated ranges of the keys it
+         * writes. Snapshot and roll back, exactly as $SET does, rather than
+         * leaving a configuration that $SAVE and $RANGE,START both refuse
+         * while naming keys the operator never typed. */
+        cfg_t       saved;
+        const char *bk = "", *br = "";
+        int         v;
+
         if (locked()) { err(SERR_READONLY, "AUTOTIME", "ranging active"); return; }
+
+        saved = *cfg();
         timing_apply_table_b(cfg());
+        v = cfg_validate(cfg(), &bk, &br);
+        if (v != 0) { *cfg() = saved; err(v, bk, br); return; }
+
         cmd_table_b();
         ok("AUTOTIME", "applied");
         return;
@@ -582,11 +606,18 @@ static void dispatch(char *payload)
             if (v != 0) { err(v, bk, br); return; }
             /* Radio keys are refused while ranging, so they can only have
              * changed since the last start. Push them to the DW1000 now rather
-             * than silently running on stale hardware settings. */
-            (void)radio_reconfigure(cfg());
+             * than silently running on stale hardware settings -- but only when
+             * actually starting: dwt_forcetrxoff()/dwt_configure() on a live
+             * node mid-frame is not a reconfiguration, it is a glitch. */
+            if (!app_ranging())
+            {
+                (void)radio_reconfigure(cfg());
+            }
             /* A duplicate-index fault latches; restarting is the operator's
              * signal that the offending node has been dealt with. */
             sync_clear_fault((sync_t *)app_sync());
+            /* Re-acquire rather than trusting a stale alarm or cold deadline. */
+            app_request_resync();
             app_ranging_set(true);
             ok("RANGE", "START");
             return;
@@ -617,7 +648,7 @@ static void dispatch(char *payload)
                 const cfg_anchor_t *a = &cfg()->anchor[i];
                 out_linef("A,%lu,0x%04X,%u,%ld,%ld,%ld,%u,%u", (unsigned long)i,
                           a->id, a->slot, (long)a->x_mm, (long)a->y_mm,
-                          (long)a->z_mm, a->ant, a->en);
+                          (long)a->z_mm, (int)a->ant, a->en);
             }
             return;
         }
@@ -648,7 +679,10 @@ static void dispatch(char *payload)
 
 static void cmd_anchor(char **p)
 {
-    uint32_t f[8];
+    /* Signed: x/y/z are int32 and the antenna trim is a signed correction, so
+     * parsing through uint32 silently turned "-100" into 65436 DTU and put a
+     * 307 m offset on that responder for good, reporting OK. */
+    long f[8];
     uint32_t i;
     cfg_anchor_t *a;
 
@@ -663,11 +697,18 @@ static void cmd_anchor(char **p)
         if (t == NULL) { err(SERR_OUT_OF_RANGE, "ANCHOR", "i,id,slot,x,y,z,ant,en"); return; }
         v = strtol(t, &end, 0);
         if (*end != '\0') { err(SERR_OUT_OF_RANGE, "ANCHOR", "bad field"); return; }
-        f[i] = (uint32_t)v;
+        f[i] = v;
     }
 
-    if (f[0] >= CFG_MAX_RESP)  { err(SERR_OUT_OF_RANGE, "ANCHOR", "index");  return; }
-    if (f[2] >= CFG_MAX_RESP)  { err(SERR_OUT_OF_RANGE, "ANCHOR", "slot");   return; }
+    if (f[0] < 0 || f[0] >= (long)CFG_MAX_RESP)
+                               { err(SERR_OUT_OF_RANGE, "ANCHOR", "index");  return; }
+    if (f[1] < 0 || f[1] > 0xFFFF)
+                               { err(SERR_OUT_OF_RANGE, "ANCHOR", "id");     return; }
+    if (f[2] < 0 || f[2] >= (long)CFG_MAX_RESP)
+                               { err(SERR_OUT_OF_RANGE, "ANCHOR", "slot");   return; }
+    if (f[6] < -32768 || f[6] > 32767)
+                               { err(SERR_OUT_OF_RANGE, "ANCHOR", "ant range -32768..32767"); return; }
+    if (f[7] < 0 || f[7] > 1)  { err(SERR_OUT_OF_RANGE, "ANCHOR", "en");     return; }
 
     a = &cfg()->anchor[f[0]];
     a->id    = (uint16_t)f[1];
@@ -675,7 +716,7 @@ static void cmd_anchor(char **p)
     a->x_mm  = (int32_t)f[3];
     a->y_mm  = (int32_t)f[4];
     a->z_mm  = (int32_t)f[5];
-    a->ant   = (uint16_t)f[6];
+    a->ant   = (int16_t)f[6];
     a->en    = (uint8_t)(f[7] ? 1u : 0u);
 
     ok("ANCHOR", "1");

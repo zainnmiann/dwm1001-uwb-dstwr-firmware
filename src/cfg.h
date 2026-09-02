@@ -47,7 +47,7 @@ typedef struct
     uint8_t  slot;          /**< slot index s                   */
     uint8_t  en;
     int32_t  x_mm, y_mm, z_mm;
-    uint16_t ant;           /**< delta_B_s, device time units   */
+    int16_t  ant;           /**< delta_B_s trim, device time units, signed */
     uint16_t pad;
 } cfg_anchor_t;
 

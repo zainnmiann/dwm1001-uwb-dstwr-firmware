@@ -1,5 +1,6 @@
 #include "cfg.h"
 #include "proto.h"
+#include "timing.h"
 #include "uart_io.h"
 
 #include <string.h>
@@ -265,7 +266,6 @@ static bool preamble_len_legal(uint16_t p)
 /* ------------------------------------------------------------------------- */
 
 /* Declared in timing.h; forward declared to keep the header dependency one-way. */
-uint32_t timing_frame_dur_us(const cfg_t *c);
 
 int cfg_validate(const cfg_t *c, const char **key, const char **reason)
 {
@@ -331,6 +331,29 @@ int cfg_validate(const cfg_t *c, const char **key, const char **reason)
                                                 { k = "report_pitch_us";r = "range 100..20000"; code = 2; goto out; }
     if (c->frame_dur_us < 1000u || c->frame_dur_us > 200000u)
                                                 { k = "frame_dur_us"; r = "range 1000..200000"; code = 2; goto out; }
+
+    /* Equations (1) and (3) reference T_r0 and T_p0 to the RX RMARKER, so a
+     * base delay shorter than the rest of that frame's air time schedules a
+     * transmit that is already in the past by the time the handler runs. At
+     * 850 kbps and below this made every Response (or Report) fail with
+     * tx_late, on every frame, with nothing refusing the configuration. */
+    {
+        uint32_t poll_tail  = timing_tail_ns(c, timing_air_poll_ns(c))  / 1000u;
+        uint32_t final_tail = timing_tail_ns(c, timing_air_final_ns(c)) / 1000u;
+
+        if (c->resp_base_us < poll_tail)
+        {
+            k = "resp_base_us";
+            r = "shorter than the Poll's air time at this operating point";
+            code = 3; goto out;
+        }
+        if (c->report_enable && c->report_base_us < final_tail)
+        {
+            k = "report_base_us";
+            r = "shorter than the Final's air time at this operating point";
+            code = 3; goto out;
+        }
+    }
 
     /* Rule 1: frame_dur_us must satisfy (14). */
     if (c->frame_dur_us < timing_frame_dur_us(c))
@@ -411,7 +434,11 @@ const cfg_anchor_t *cfg_anchor_by_id(uint16_t id)
     uint32_t i;
     for (i = 0; i < CFG_MAX_RESP; i++)
     {
-        if (m_cfg.anchor[i].id == id)
+        /* `en` is tested here too. Without it a listener applied the antenna
+         * trim of a disabled entry while the initiator (via by_slot) did not,
+         * so the two reported different distances for the same exchange -- and
+         * a listener picked up trims from every stale default entry. */
+        if (m_cfg.anchor[i].en && m_cfg.anchor[i].id == id)
         {
             return &m_cfg.anchor[i];
         }

@@ -33,7 +33,20 @@
  * sized for RX-side alarm drift, not TX-side prep) -- every attempt missed its
  * slot at that margin. This is deliberately generous; it costs receive time
  * only (an initiator alone still free-runs fine), never ranging accuracy. */
-#define TX_PREP_MARGIN_US       1500u
+#define TX_PREP_FLOOR_US        200u
+
+/* The margin is proc_poll_us, the settable key that $MEASURE reports and that
+ * app.h already documents as "Directly comparable to TX_PREP_MARGIN_US". As a
+ * file-local constant it could not be tuned at all: an operator following
+ * $MEASURE's own advice changed a value that fed only eq (14) while the receive
+ * window kept closing 1500 us early -- and that window is where sync_on_poll()
+ * has to hear the other initiators, so the measurement round prescribed by
+ * section 13 step 5 could never actually shrink it. */
+static uint32_t tx_prep_margin_us(const cfg_t *c)
+{
+    return (c->proc_poll_us > TX_PREP_FLOOR_US) ? c->proc_poll_us
+                                                : TX_PREP_FLOOR_US;
+}
 
 static uint8_t  m_buf[MAX_FRAME_LEN];
 static uint8_t  m_seq;
@@ -121,7 +134,21 @@ static void collect_report(const radio_rx_t *rx, const cfg_t *c)
     s = g_u8(rx->buf, REP_IDX_SLOT);
     if (s >= c->resp_count)                                  { return; }
 
-    m_tau_ps[s] = g_u32(rx->buf, REP_IDX_TOF_PS);
+    {
+        /* Bounded like ranging_tof_dtu()/ranging_tof_ss_s(). This was the one
+         * path by which a tau reached the output without passing either: a
+         * corrupt or cross-talking Report carrying 0xFFFFFFFF was emitted as a
+         * clean 1287 km $RNG line with no flag set. Rejecting it leaves the
+         * mask bit clear, so the slot degrades to the SS-TWR fallback. */
+        uint32_t ps = g_u32(rx->buf, REP_IDX_TOF_PS);
+
+        if (ps > RANGING_MAX_TOF_PS)
+        {
+            app_stats()->rejected++;
+            return;
+        }
+        m_tau_ps[s] = ps;
+    }
     m_rxp   [s] = BYTE_TO_PWR_DBM10(g_u8(rx->buf, REP_IDX_RXP));
     m_fpp   [s] = BYTE_TO_PWR_DBM10(g_u8(rx->buf, REP_IDX_FPP));
     m_rep_mask |= (uint16_t)(1u << s);
@@ -177,13 +204,24 @@ static void emit_ranges(const cfg_t *c, uint64_t poll_tx, uint64_t final_tx)
         }
         else
         {
-            /* Section 11: Report lost -> fall back to eq (7), flag bit0. */
+            /* Section 11: Report lost -> fall back to eq (7), flag bit0.
+             *
+             * With report_enable = 0 there is no Report group at all, so this
+             * is the configured steady state rather than a loss: flagging bit3
+             * and counting reports_lost on every slot of every frame made a
+             * real Report loss indistinguishable from the option being off and
+             * left the loss statistics unusable. SS_FALLBACK still applies --
+             * eq (7) is genuinely what produced this range. */
             double k    = ranging_k_hat(m_integ[s], c->channel, c->datarate);
             double tof  = ranging_tof_ss_s(poll_tx, m_resp_rx[s],
                                            m_poll_rx[s], m_resp_tx[s], k);
-            app_stats()->reports_lost++;
+            if (c->report_enable)
+            {
+                app_stats()->reports_lost++;
+                r.flags |= RNG_FLAG_REPORT_LOST;
+            }
             app_stats()->ss_fallback++;
-            r.flags |= RNG_FLAG_SS_FALLBACK | RNG_FLAG_REPORT_LOST;
+            r.flags |= RNG_FLAG_SS_FALLBACK;
 
             if (tof < 0.0)
             {
@@ -440,6 +478,13 @@ void app_run_initiator(void)
             continue;
         }
 
+        if (app_take_resync())
+        {
+            sync_start(&m_sync, c);
+            was_ranging = true;
+            continue;
+        }
+
         if (!was_ranging)
         {
             /* Restarting after a stop: t_next_hi32 refers to an instant that
@@ -497,7 +542,7 @@ void app_run_initiator(void)
             continue;
         }
 
-        if (rem <= (int32_t)TX_PREP_MARGIN_US)
+        if (rem <= (int32_t)tx_prep_margin_us(c))
         {
             /* Section 6: a frame elapsed; sync_on_poll clears this again the
              * moment any initiator is heard. */
@@ -514,8 +559,8 @@ void app_run_initiator(void)
         }
 
         /* Close the receive window well before the alarm so there is time to
-         * build the Poll and arm the delayed transmit (see TX_PREP_MARGIN_US). */
-        rem -= (int32_t)TX_PREP_MARGIN_US;
+         * build the Poll and arm the delayed transmit (see tx_prep_margin_us). */
+        rem -= (int32_t)tx_prep_margin_us(c);
         if (rem > 60000) { rem = 60000; }
 
         r = radio_rx(&rx, (uint32_t)rem, false, 0);

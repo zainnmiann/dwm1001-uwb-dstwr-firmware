@@ -32,7 +32,21 @@ static uint32_t cold_window_us(const cfg_t *c)
 
 void sync_start(sync_t *s, const cfg_t *c)
 {
+    /* The counters are lifetime diagnostics, not per-acquisition state. Zeroing
+     * them here reset $STAT's rearm/freerun/dup_index/desync at precisely the
+     * moments the events they count occur -- a drift reset or a stale alarm is
+     * what calls sync_start() -- so the operator lost the history exactly when
+     * it became interesting. $STAT,CLEAR is the way to zero them. */
+    uint32_t n_rearm  = s->n_rearm;
+    uint32_t n_free   = s->n_freerun;
+    uint32_t n_dup    = s->n_dup;
+    uint32_t n_drift  = s->n_drift_reset;
+
     memset(s, 0, sizeof(*s));
+    s->n_rearm       = n_rearm;
+    s->n_freerun     = n_free;
+    s->n_dup         = n_dup;
+    s->n_drift_reset = n_drift;
     s->state = SYNC_COLD;
     s->cold_deadline_hi32 = radio_systime_hi32() + us_to_hi32(cold_window_us(c));
 }
@@ -193,7 +207,15 @@ void sync_missed_frame(sync_t *s, const cfg_t *c)
          * init_count >= sync_mmax (both individually legal) the very first
          * alarm would flip a perfectly locked node into FREERUN and stamp
          * RNG_FLAG_DESYNC on every line thereafter. */
-        if (elapsed >= c->sync_mmax) { elapsed = (uint32_t)c->sync_mmax - 1u; }
+        /* Floor of 1: at the legal setting sync_mmax = 1 the old clamp yielded
+         * 0, so s->missed never advanced and SYNC_FREERUN -- and therefore
+         * RNG_FLAG_DESYNC -- was unreachable. sync_mmax = 1 means "one missed
+         * frame is a desync", the most aggressive setting, so it must cross on
+         * the first silent superframe rather than never. */
+        if (elapsed >= c->sync_mmax)
+        {
+            elapsed = (c->sync_mmax > 1u) ? ((uint32_t)c->sync_mmax - 1u) : 1u;
+        }
         s->missed += elapsed;
     }
 
