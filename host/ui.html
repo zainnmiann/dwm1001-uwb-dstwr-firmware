@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UWB RTLS</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --line:#262d38; --ink:#e6edf3; --dim:#8b949e;
+    --a-live:#3fb950; --a-dead:#484f58; --t1:#58a6ff; --t2:#d29922; --warn:#f85149;
+    --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  header{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+         padding:12px 18px;border-bottom:1px solid var(--line)}
+  header h1{margin:0;font-size:15px;font-weight:600;letter-spacing:.3px}
+  .pill{font:12px/1 var(--mono);padding:4px 8px;border-radius:999px;
+        background:var(--panel);border:1px solid var(--line);color:var(--dim)}
+  .pill b{color:var(--ink);font-weight:600}
+  main{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:0;
+       height:calc(100vh - 50px)}
+  @media(max-width:900px){main{grid-template-columns:1fr;height:auto}}
+  #wrap{position:relative;min-width:0;background:
+        radial-gradient(circle at 50% 40%,#131922,#0e1116 70%)}
+  canvas{display:block;width:100%;height:100%}
+  aside{border-left:1px solid var(--line);overflow-y:auto;background:var(--panel)}
+  @media(max-width:900px){aside{border-left:0;border-top:1px solid var(--line)}}
+  section{padding:14px 16px;border-bottom:1px solid var(--line)}
+  h2{margin:0 0 10px;font-size:12px;text-transform:uppercase;
+     letter-spacing:.08em;color:var(--dim);font-weight:600}
+  table{width:100%;border-collapse:collapse;font:12px/1.5 var(--mono)}
+  th,td{text-align:right;padding:3px 4px}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--dim);font-weight:500;border-bottom:1px solid var(--line)}
+  .tagname{display:inline-flex;align-items:center;gap:7px;font-weight:600;
+           font-size:13px;font-family:var(--mono)}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none}
+  .kv{display:flex;justify-content:space-between;gap:10px;
+      font:12px/1.7 var(--mono)}
+  .kv span:first-child{color:var(--dim)}
+  .stale{color:var(--warn)}
+  .muted{color:var(--dim)}
+  .bar{height:3px;border-radius:2px;background:var(--line);overflow:hidden;margin-top:2px}
+  .bar>i{display:block;height:100%;background:var(--a-live)}
+</style>
+</head>
+<body>
+<header>
+  <h1>UWB RTLS &mdash; live</h1>
+  <span class="pill">tags <b id="hTags">0</b></span>
+  <span class="pill">anchors live <b id="hAnch">0</b>/<b id="hPlan">0</b></span>
+  <span class="pill">rate <b id="hRate">0</b> Hz</span>
+  <span class="pill" id="hConn">connecting…</span>
+  <span class="pill" id="hMqtt">mqtt off</span>
+</header>
+
+<main>
+  <div id="wrap"><canvas id="cv"></canvas></div>
+  <aside id="side"></aside>
+</main>
+
+<script>
+const TAGCOL = ["#58a6ff","#d29922","#a371f7","#3fb950","#db6d28","#1f6feb"];
+let state = null, trails = {}, frames = [], planned = {};
+
+/* ---------- fetch loop ---------- */
+async function poll(){
+  try{
+    const r = await fetch("/api/state",{cache:"no-store"});
+    state = await r.json();
+    planned = state.planned || {};
+    document.getElementById("hConn").textContent = "connected";
+    document.getElementById("hConn").style.color = "var(--a-live)";
+    // frame counter for an observed-rate readout
+    frames.push(performance.now());
+    while(frames.length && frames[0] < performance.now()-2000) frames.shift();
+    for(const [name,t] of Object.entries(state.tags||{})){
+      const p = t.onboard?.pos || t.lsq;
+      if(p && !t.stale){
+        (trails[name] = trails[name] || []).push(p);
+        if(trails[name].length > 300) trails[name].shift();
+      }
+    }
+    draw(); side();
+  }catch(e){
+    const c = document.getElementById("hConn");
+    c.textContent = "server offline"; c.style.color = "var(--warn)";
+  }
+}
+
+/* ---------- world -> screen ---------- */
+function bounds(){
+  const pts = Object.values(planned).map(p=>[p[0],p[1]]);
+  for(const t of Object.values(state?.tags||{})){
+    const p = t.onboard?.pos || t.lsq; if(p) pts.push([p[0],p[1]]);
+  }
+  if(!pts.length) return {x0:0,y0:0,x1:30,y1:30};
+  const xs=pts.map(p=>p[0]), ys=pts.map(p=>p[1]), m=3;
+  return {x0:Math.min(...xs)-m, y0:Math.min(...ys)-m,
+          x1:Math.max(...xs)+m, y1:Math.max(...ys)+m};
+}
+
+function draw(){
+  const cv=document.getElementById("cv"), wrap=document.getElementById("wrap");
+  const dpr=devicePixelRatio||1, W=wrap.clientWidth, H=wrap.clientHeight||520;
+  cv.width=W*dpr; cv.height=H*dpr;
+  const g=cv.getContext("2d"); g.scale(dpr,dpr); g.clearRect(0,0,W,H);
+
+  const b=bounds(), sx=W/(b.x1-b.x0), sy=H/(b.y1-b.y0), s=Math.min(sx,sy);
+  const ox=(W-(b.x1-b.x0)*s)/2, oy=(H-(b.y1-b.y0)*s)/2;
+  // y is flipped so +y reads "up", matching a floor plan
+  const X = x => ox + (x-b.x0)*s;
+  const Y = y => H - oy - (y-b.y0)*s;
+
+  /* grid every 5 m */
+  g.strokeStyle="#1c2330"; g.lineWidth=1; g.font="10px ui-monospace";
+  g.fillStyle="#4d5866";
+  for(let x=Math.ceil(b.x0/5)*5; x<=b.x1; x+=5){
+    g.beginPath(); g.moveTo(X(x),0); g.lineTo(X(x),H); g.stroke();
+    g.fillText(x+"m", X(x)+3, H-4);
+  }
+  for(let y=Math.ceil(b.y0/5)*5; y<=b.y1; y+=5){
+    g.beginPath(); g.moveTo(0,Y(y)); g.lineTo(W,Y(y)); g.stroke();
+    g.fillText(y+"m", 3, Y(y)-3);
+  }
+
+  const seen = state?.anchors_seen || {};
+  // Three states, not two. The firmware ranges with only 4 anchors per cycle, so a
+  // healthy anchor can legitimately go quiet for tens of seconds while it
+  // waits its turn -- calling that "offline" would be wrong, but so is
+  // showing an anchor green forever after one sighting.
+  const anchState = p => {
+    const now = state.now;
+    let best = null;
+    for(const a of Object.values(seen)){
+      if(Math.abs(a.pos[0]-p[0])<0.05 && Math.abs(a.pos[1]-p[1])<0.05)
+        best = Math.min(best==null?1e9:best, now - a.last);
+    }
+    if(best==null) return "never";
+    if(best < 5)  return "live";
+    if(best < 90) return "idle";
+    return "lost";
+  };
+  const COL = {live:"#3fb950", idle:"#d29922", lost:"#f85149", never:"#39404d"};
+
+  /* range circles from each live anchor to each tag */
+  for(const [name,t] of Object.entries(state?.tags||{})){
+    if(t.stale || !t.anchors) continue;
+    g.strokeStyle="rgba(88,166,255,.10)"; g.lineWidth=1;
+    for(const a of t.anchors){
+      g.beginPath(); g.arc(X(a.pos[0]),Y(a.pos[1]),a.range*s,0,7); g.stroke();
+    }
+  }
+
+  /* anchors */
+  for(const [id,p] of Object.entries(planned)){
+    const st=anchState(p), col=COL[st], px=X(p[0]), py=Y(p[1]);
+    g.fillStyle = col;                            // canvas has no CSS vars
+    g.beginPath(); g.rect(px-6,py-6,12,12); g.fill();
+    if(p[2] > 5){ // ceiling anchor: ring it
+      g.strokeStyle=col; g.lineWidth=1.5;
+      g.beginPath(); g.arc(px,py,11,0,7); g.stroke();
+    }
+    g.fillStyle = st==="never" ? "#5b6470" : "#e6edf3";
+    g.font="600 11px ui-monospace";
+    g.fillText("A"+String(id).padStart(2,"0"), px+10, py-8);
+    g.fillStyle="#6e7781"; g.font="10px ui-monospace";
+    g.fillText("z="+p[2].toFixed(2), px+10, py+4);
+  }
+  /* legend */
+  const leg=[["live","heard <5s"],["idle","waiting for a slot"],
+             ["lost",">90s silent"],["never","not flashed"]];
+  g.font="10px ui-monospace";
+  leg.forEach(([k,txt],i)=>{
+    const ly=14+i*14;
+    g.fillStyle=COL[k]; g.fillRect(10,ly-7,9,9);
+    g.fillStyle="#8b949e"; g.fillText(`${k} — ${txt}`, 24, ly);
+  });
+
+  /* tags */
+  let i=0;
+  for(const [name,t] of Object.entries(state?.tags||{})){
+    const col=TAGCOL[i++%TAGCOL.length];
+    const tr=trails[name]||[];
+    if(tr.length>1){
+      g.strokeStyle=col+"55"; g.lineWidth=1.5; g.beginPath();
+      tr.forEach((p,k)=>k?g.lineTo(X(p[0]),Y(p[1])):g.moveTo(X(p[0]),Y(p[1])));
+      g.stroke();
+    }
+    const onboard=t.onboard?.pos, lsq=t.lsq;
+    if(lsq){ // our own solution: hollow ring
+      g.strokeStyle=col; g.lineWidth=1.5; g.setLineDash([3,3]);
+      g.beginPath(); g.arc(X(lsq[0]),Y(lsq[1]),9,0,7); g.stroke();
+      g.setLineDash([]);
+    }
+    if(onboard){
+      g.fillStyle = t.stale ? "#6e7781" : col;
+      g.beginPath(); g.arc(X(onboard[0]),Y(onboard[1]),6,0,7); g.fill();
+      g.fillStyle="#e6edf3"; g.font="600 12px ui-monospace";
+      g.fillText(name, X(onboard[0])+11, Y(onboard[1])-9);
+    }
+  }
+}
+
+/* ---------- side panel ---------- */
+function side(){
+  const seen=state?.anchors_seen||{};
+  document.getElementById("hTags").textContent=Object.keys(state?.tags||{}).length;
+  document.getElementById("hAnch").textContent=Object.keys(seen).length;
+  document.getElementById("hPlan").textContent=Object.keys(planned).length;
+  document.getElementById("hRate").textContent=(frames.length/2).toFixed(1);
+
+  const M=state?.mqtt, mp=document.getElementById("hMqtt");
+  if(!M){ mp.textContent="mqtt off"; mp.style.color="var(--dim)"; }
+  else {
+    mp.innerHTML = M.connected
+      ? `mqtt <b>${M.host}</b> &middot; ${M.published.toLocaleString()} sent`
+        + (M.dropped?` &middot; <b>${M.dropped} dropped</b>`:"")
+      : `mqtt <b>${M.host}</b> offline`;
+    mp.style.color = M.connected ? (M.dropped?"var(--t2)":"var(--a-live)") : "var(--warn)";
+  }
+
+  let h=""; let i=0;
+  for(const [name,t] of Object.entries(state?.tags||{})){
+    const col=TAGCOL[i++%TAGCOL.length];
+    h+=`<section><div class="tagname"><span class="dot" style="background:${col}"></span>${name}`;
+    h+= t.stale ? ` <span class="stale">stale ${t.age??"?"}s</span>`
+               : ` <span class="muted">${t.age??0}s</span>`;
+    h+=`</div>`;
+    if(!t.connected){
+      h+=`<div class="stale">disconnected${t.error?": "+t.error:""}</div></section>`;
+      continue;
+    }
+    const P=t.onboard, L=t.lsq;
+    h+=`<div class="kv"><span>ONBOARD</span><span>${P?fmt(P.pos):"&mdash;"}</span></div>`;
+    h+=`<div class="kv"><span>qf</span><span>${P?P.qf+"%":"&mdash;"}</span></div>`;
+    if(P) h+=`<div class="bar"><i style="width:${P.qf}%"></i></div>`;
+    h+=`<div class="kv"><span>LSQ</span><span>${L?fmt(L):"&mdash;"}</span></div>`;
+    h+=`<div class="kv"><span>residual</span><span>${t.rms!=null?(t.rms*100).toFixed(1)+" cm":"&mdash;"}</span></div>`;
+    h+=`<div class="kv"><span>solve</span><span>${t.mode||"&mdash;"}</span></div>`;
+    if(P&&L){
+      const d=Math.hypot(P.pos[0]-L[0],P.pos[1]-L[1],P.pos[2]-L[2]);
+      h+=`<div class="kv"><span>ONBOARD&ndash;LSQ</span><span>${(d*100).toFixed(0)} cm</span></div>`;
+    }
+    if(t.excluded?.length)
+      h+=`<div class="kv"><span>rejected</span><span class="stale">${t.excluded.join(", ")}</span></div>`;
+    const R = state.rates?.[name];
+    if(R) h+=`<div class="kv"><span>tag rate</span><span>${R.tag_hz.toFixed(2)} Hz</span></div>`;
+    if(t.anchors?.length){
+      const seenIds = new Set(t.anchors.map(a=>a.id));
+      // include anchors this tag has ranged with recently but not in this frame
+      const allIds = new Set([...seenIds, ...Object.keys(R?.anchors||{})]);
+      h+=`<table><tr><th>anchor</th><th>Hz</th><th>%</th><th>mean</th><th>sd</th><th>resid</th></tr>`;
+      for(const id of [...allIds].sort()){
+        const a = t.anchors.find(x=>x.id===id);
+        const e = R?.anchors?.[id];
+        const bad = t.excluded?.includes(id);
+        const rv = !a || a.resid==null ? "&mdash;" : (a.resid*100).toFixed(0);
+        const col = bad ? "var(--warn)"
+                  : (e?.sd!=null && e.sd>0.5) ? "var(--warn)"
+                  : (a?.resid!=null && Math.abs(a.resid)>0.5) ? "var(--t2)"
+                  : (!a ? "var(--dim)" : "inherit");
+        h+=`<tr style="color:${col}"><td>${id}${bad?" ✕":""}</td>
+            <td>${e?e.hz.toFixed(1):"&mdash;"}</td>
+            <td>${e?e.share.toFixed(0):"&mdash;"}</td>
+            <td>${e?.mean!=null?(e.mean*100).toFixed(0):"&mdash;"}</td>
+            <td>${e?.sd!=null?(e.sd*100).toFixed(1):"&mdash;"}</td>
+            <td>${rv}</td></tr>`;
+      }
+      h+=`</table>`;
+      h+=`<div class="muted" style="font-size:11px;margin-top:4px">
+          Hz over ${state.window||10}s &middot; mean/sd/resid in cm over ${state.stat_window||60}s</div>`;
+    }
+    h+=`</section>`;
+  }
+
+  h+=`<section><h2>anchors</h2><table>
+      <tr><th>id</th><th>x</th><th>y</th><th>z</th><th>last</th><th>state</th></tr>`;
+  const COL={live:"#3fb950",idle:"#d29922",lost:"#f85149",never:"#6e7781"};
+  for(const [id,p] of Object.entries(planned)){
+    let age=null;
+    for(const a of Object.values(seen))
+      if(Math.abs(a.pos[0]-p[0])<0.05&&Math.abs(a.pos[1]-p[1])<0.05)
+        age = age==null ? state.now-a.last : Math.min(age, state.now-a.last);
+    const st = age==null ? "never" : age<5 ? "live" : age<90 ? "idle" : "lost";
+    h+=`<tr><td>A${String(id).padStart(2,"0")}</td><td>${p[0].toFixed(2)}</td>
+        <td>${p[1].toFixed(2)}</td><td>${p[2].toFixed(2)}</td>
+        <td class="muted">${age==null?"&mdash;":age.toFixed(0)+"s"}</td>
+        <td style="color:${COL[st]}">${st}</td></tr>`;
+  }
+  h+=`</table></section>`;
+  document.getElementById("side").innerHTML=h;
+}
+const fmt=p=>`${p[0].toFixed(2)}, ${p[1].toFixed(2)}, ${p[2].toFixed(2)}`;
+
+addEventListener("resize",()=>state&&draw());
+poll(); setInterval(poll,200);
+</script>
+</body>
+</html>
