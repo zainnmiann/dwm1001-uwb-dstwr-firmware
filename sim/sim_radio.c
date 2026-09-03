@@ -22,14 +22,18 @@ void sim_bind_clock(const nclk_t *c, int64_t now_dtu)
 
 int64_t sim_global_from_hi32(const nclk_t *c, uint32_t hi32, int64_t after)
 {
-    /* Lift the 32-bit view back onto the full timeline using `after` as the
-     * epoch, then invert the clock. */
-    int64_t  base = sim_local_dtu(c, after);
-    uint64_t want = ((uint64_t)hi32) << 8;
-    uint64_t have = (uint64_t)base & DTU_MASK_40;
-    int64_t  delta = (int64_t)((want - (have & ~0xFFULL)) & 0xFFFFFFFF00ULL);
+    int64_t  base    = sim_local_dtu(c, after);
+    uint32_t base_hi = (uint32_t)((uint64_t)base >> 8);
+    /* Signed hi32 distance, so the 32-bit wrap is handled without a magnitude
+     * guess: alarms are always well inside +/-8.6 s. Align to the hi32
+     * boundary rather than adding a delta to `base`, which would keep base's
+     * own low 8 bits and inject a spurious 0..255 DTU offset -- mean 127 DTU,
+     * 2.0 ns, which lands as ~0.6 m of range error once it reaches a TX
+     * timestamp. */
+    int32_t  d     = (int32_t)(hi32 - base_hi);
+    int64_t  local = (base - (base & 0xFF)) + ((int64_t)d << 8);
 
-    return sim_global_from_local(c, base + delta);
+    return sim_global_from_local(c, local);
 }
 
 uint32_t radio_systime_hi32(void)

@@ -54,8 +54,25 @@ void sync_start(sync_t *s, const cfg_t *c)
 
 void sync_adopt_local_epoch(sync_t *s, const cfg_t *c)
 {
-    /* Nothing heard in 2 T_F: we are first, the others will align to us. */
-    s->t_next_hi32 = radio_systime_hi32() + us_to_hi32(c->frame_dur_us);
+    /* Nothing heard in 2 T_F: we are first, the others will align to us.
+     *
+     * The frame index has to be in here. Section 3 gives frame k the k-th
+     * frame of the superframe, so a node that believes it is first -- and
+     * therefore that its own epoch defines the superframe -- belongs at offset
+     * k T_f from that epoch, not at T_f like everyone else.
+     *
+     * Without the term, N initiators powered on together are lethal to each
+     * other: cold_window_us() is the same for all of them, so they all leave
+     * COLD within microseconds (only crystal phase separates them), all place
+     * their first Poll one T_f out, and collide. Nobody then hears anybody, so
+     * nobody ever rearms, and they re-collide every superframe. At +/-20 ppm
+     * they need thousands of superframes to drift a frame width apart. Found
+     * by the fork harness, which starts all sixteen nodes at once; the
+     * single-process simulator could not see it because it hand-starts one
+     * initiator ahead of the others. */
+    s->t_next_hi32 = radio_systime_hi32()
+                   + us_to_hi32((1u + (uint32_t)c->frame_index)
+                                * c->frame_dur_us);
     s->sfn         = 0;
     s->state       = SYNC_FREERUN;
     s->missed      = 0;
