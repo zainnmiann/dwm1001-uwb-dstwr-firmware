@@ -17,11 +17,21 @@
 #define CFG_MAX_RESP            12u     /* resp_count range 2..12  */
 #define CFG_NAME_LEN            17u     /* 16 chars + NUL          */
 
-/* Placeholder written by cfg_defaults() for ant_delay_tx/rx. Section 8.1's
- * default for these is "calibrated", so this value means "not yet calibrated":
+/* Sentinel written by cfg_defaults() for ant_delay_tx/rx. Section 8.1's
+ * default for these is "calibrated", so it means "not yet calibrated":
  * radio.c substitutes the part's own OTP antenna delay when it sees it, and
- * section 13 step 1 replaces it with a surveyed-baseline measurement. */
-#define CFG_ANT_DELAY_UNCAL     16385u
+ * section 13 step 1 replaces it with a surveyed-baseline measurement.
+ *
+ * 0xFFFF, not 16385. 16385 is a perfectly plausible delay -- it is within 51
+ * units of the canonical DWM1001 figure -- so it could not be told apart from
+ * a board deliberately calibrated to it, and "calibrate to 16385" silently
+ * meant "ignore my calibration". 0xFFFF is 1.02 us, 307 m of range, which no
+ * antenna has. */
+#define CFG_ANT_DELAY_UNCAL     0xFFFFu
+
+/* Used when the sentinel is set and the part has no OTP value. Decawave's
+ * canonical DWM1001 antenna delay; section 13 step 1 replaces it per board. */
+#define CFG_ANT_DELAY_DEFAULT   16436u
 #define CFG_SSID_LEN            33u     /* 32 chars + NUL          */
 
 /* --- enums --------------------------------------------------------------- */

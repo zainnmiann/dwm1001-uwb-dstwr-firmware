@@ -290,31 +290,38 @@ static void test_missed_clamp(void)
 }
 
 /* ---------------------------------------------------------------------------
- * Antenna delay: both provisioning paths must total the same compensation.
+ * Antenna delay: the same value belongs in BOTH registers.
  * ------------------------------------------------------------------------ */
-#define CFG_ANT_DELAY_UNCAL 16385u
+#define CFG_ANT_DELAY_UNCAL     0xFFFFu
+#define CFG_ANT_DELAY_DEFAULT   16436u
+#define DTU_PS                  15.650040
 
-static void test_ant_delay_split(void)
+static void test_ant_delay(void)
 {
-    /* The OTP word and the uncalibrated placeholder are both *combined* TX+RX
-     * values, so both must be halved. Programming the placeholder into both
-     * registers doubled this node's compensation, and two co-located nodes
-     * then disagreed by delta/2 (~128 ns of tau, ~38 m) purely on whether
-     * their OTP happened to be blank. */
-    uint32_t otp = 16400u;
-    uint32_t otp_tx = otp / 2u,  otp_rx = otp - otp_tx;
-    uint32_t unc_tx = CFG_ANT_DELAY_UNCAL / 2u;
-    uint32_t unc_rx = CFG_ANT_DELAY_UNCAL - unc_tx;
+    /* dwt_settxantennadelay() and dwt_setrxantennadelay() each take the full
+     * one-way delay for their own direction. Halving one figure across the two
+     * -- which this project did until hardware disproved it -- under-
+     * compensates all four timestamps of an exchange, and the shortfall lands
+     * on tau as 4 * (d/2) / 2 = d. */
+    uint32_t d = CFG_ANT_DELAY_DEFAULT;
+    double   err_m = (double)d * DTU_PS * 1e-12 * 299702547.0;
 
-    CHECK(otp_tx + otp_rx == otp, "OTP split must be lossless");
-    CHECK(unc_tx + unc_rx == CFG_ANT_DELAY_UNCAL, "fallback split must be lossless");
+    CHECK(err_m > 70.0 && err_m < 85.0,
+          "halving the delay should cost ~77 m of range, got %.1f m", err_m);
 
-    /* The two conventions must agree to within the placeholder's own offset
-     * from a typical OTP value -- not a factor of two. */
+    /* The sentinel must not be mistakable for a real delay. A DWM1001 sits
+     * near 16436; anything within a few hundred units of that is a value
+     * somebody might legitimately calibrate to. */
+    CHECK(CFG_ANT_DELAY_UNCAL > CFG_ANT_DELAY_DEFAULT + 1000u,
+          "sentinel 0x%X is too close to a real antenna delay",
+          CFG_ANT_DELAY_UNCAL);
     {
-        long diff = (long)(otp_tx + otp_rx) - (long)(unc_tx + unc_rx);
-        CHECK(diff > -1000 && diff < 1000,
-              "OTP and fallback totals differ by %ld DTU", diff);
+        double sentinel_m =
+            (double)CFG_ANT_DELAY_UNCAL * DTU_PS * 1e-12 * 299702547.0;
+
+        CHECK(sentinel_m > 250.0,
+              "sentinel should be physically impossible, it is %.0f m",
+              sentinel_m);
     }
 }
 
@@ -327,7 +334,7 @@ int main(void)
     test_rng_record_size();
     test_frame_lengths();
     test_missed_clamp();
-    test_ant_delay_split();
+    test_ant_delay();
 
     printf("%s: %d checks, %d failed\n", g_fail ? "FAIL" : "PASS", g_run, g_fail);
     return g_fail ? 1 : 0;

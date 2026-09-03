@@ -238,9 +238,21 @@ static void apply_cfg(const cfg_t *c)
     apply_txpower(c);
 
     /* Section 8.1 default is "calibrated": prefer this part's own OTP value
-     * when the configuration still carries the uncalibrated placeholder, and
-     * split it evenly across the TX and RX halves ("delta split" in the same
-     * table). An explicitly configured delay always wins. */
+     * when the configuration still carries the uncalibrated sentinel. An
+     * explicitly configured delay always wins.
+     *
+     * The SAME value goes into both registers. This used to be halved across
+     * them, which is wrong: dwt_settxantennadelay() and
+     * dwt_setrxantennadelay() each take the full one-way delay for their own
+     * direction, and Decawave's own examples program the identical figure to
+     * both. Halving under-compensates every one of the four timestamps in an
+     * exchange, and the shortfall lands on tau as
+     *   4 * (delay/2) / 2 = delay
+     * -- 16436 device time units, 257 ns, 77.2 m. Measured on hardware as
+     * exactly that: four ranges that should have read about 1 m all read
+     * 77.8 m, and setting the registers to the full value collapsed them to
+     * 0.81-1.00 m. An earlier round reasoned the opposite way from a
+     * previously calibrated board and got this backwards. */
     m_ant_tx = c->ant_delay_tx;
     m_ant_rx = c->ant_delay_rx;
 
@@ -249,23 +261,14 @@ static void apply_cfg(const cfg_t *c)
         bool    uncal   = (c->ant_delay_tx == CFG_ANT_DELAY_UNCAL
                            && c->ant_delay_rx == CFG_ANT_DELAY_UNCAL);
 
-        if (m_otp_antdly_valid[prf_idx] && uncal)
+        if (uncal)
         {
-            m_ant_tx = (uint16_t)(m_otp_antdly[prf_idx] / 2u);
-            m_ant_rx = (uint16_t)(m_otp_antdly[prf_idx] - m_ant_tx);
-        }
-        else if (uncal)
-        {
-            /* No OTP value on this part. CFG_ANT_DELAY_UNCAL is a *combined*
-             * TX+RX placeholder, exactly like the OTP word, so it must be
-             * split the same way. Programming it into both registers made the
-             * total compensation 2x that of an OTP-programmed part: two
-             * co-located nodes would then disagree by delta/2 = ~128 ns of
-             * tau, some 38 m, decided purely by whether their OTP happened to
-             * be blank. Confirmed against hardware -- a surveyed 4.769 m
-             * baseline reads correct under the split convention. */
-            m_ant_tx = (uint16_t)(CFG_ANT_DELAY_UNCAL / 2u);
-            m_ant_rx = (uint16_t)(CFG_ANT_DELAY_UNCAL - m_ant_tx);
+            uint16_t d = m_otp_antdly_valid[prf_idx]
+                       ? m_otp_antdly[prf_idx]
+                       : CFG_ANT_DELAY_DEFAULT;
+
+            m_ant_tx = d;
+            m_ant_rx = d;
         }
     }
 

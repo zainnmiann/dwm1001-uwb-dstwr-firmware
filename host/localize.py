@@ -67,13 +67,23 @@ NODE_NAMES = {
     "000760131615": "A02",
     "000760100815": "A04",
     "000760131579": "A01",
+    # The four boards on this branch's DS-TWR firmware. Deliberately not
+    # T0x/A0x: every one of those labels is already taken above by a different
+    # serial, and two boards answering to one label is worse than a long name.
+    "000760131590": "TAG1",
+    "000760131633": "TAG2",
+    "000760131573": "ANC1",
+    "000760131584": "ANC2",
 }
 
 # 4-hex UWB id -> the label set on that anchor with `nls`. The firmware sends only the
 # id in the lec stream, so the label has to be resolved here on the host.
 ANCHOR_NAMES = {"1FF8": "A01", "3002": "A02", "155B": "A03",
                 "D089": "A04", "1FE6": "A05", "4659": "A06",
-                "216A": "A07", "1925": "A08", "3003": "A09"}
+                "216A": "A07", "1925": "A08", "3003": "A09",
+                # This branch's anchors carry explicitly assigned addresses
+                # rather than PANS labels, so slot order is the name.
+                "0101": "ANC1", "0102": "ANC2"}
 
 # The device shell echoes each character and drops fast bursts.
 CHAR_DELAY = 0.03
@@ -304,17 +314,41 @@ class Mqtt:
             # estimate of when the fix was taken (dwm_systime_us_get(), wraps
             # ~35 min, unwrapped to monotonic here; not available on stock
             # stock lec). timestamp_received is when this machine parsed the line.
-            self.emit(f"ranging/{tag}/{label}", {
+            msg_r = {
                 "tag_label": tag,
                 "anchor_label": label,
                 "range_m": round(a["range"], 3),
-                "rssi": round(estimate_rssi_dbm(a["range"], a.get("dist_qf")), 1),
                 "timestamp_sent": rd.get("device_us"),
                 "timestamp_received": round(rd["t"], 3),
-            })
+            }
+            if a.get("rxp_dbm") is not None:
+                # A real measurement on this firmware: rxp/fpp come from
+                # dwt_readdiagnostics() on the DW1000. rssi_estimated stays
+                # false so a consumer can tell it apart from the path-loss
+                # figure the PANS builds have to fall back on.
+                msg_r.update({
+                    "rssi": round(a["rxp_dbm"], 1),
+                    "rssi_estimated": False,
+                    "first_path_dbm": round(a["fpp_dbm"], 1),
+                    "tof_ps": a.get("tof_ps"),
+                    "slot": a.get("slot"),
+                    "flags": a.get("flags"),
+                    "flag_names": a.get("flag_names"),
+                })
+            else:
+                msg_r.update({
+                    "rssi": round(estimate_rssi_dbm(a["range"],
+                                                    a.get("dist_qf")), 1),
+                    "rssi_estimated": True,
+                })
+            self.emit(f"ranging/{tag}/{label}", msg_r)
         msg = {"tag_label": tag, "n_anchors": len(rd["anchors"]),
                "host_time": round(rd["t"], 3), "device_us": rd.get("device_us"),
                "fw": rd.get("fw", "stock"), "seq": seq}
+        if rd.get("sfn") is not None:
+            msg["sfn"] = rd["sfn"]
+        if rd.get("lost_slots"):
+            msg["lost_slots"] = rd["lost_slots"]
         if rd.get("onboard"):
             msg["onboard"] = {"x": rd["onboard"]["pos"][0], "y": rd["onboard"]["pos"][1],
                               "z": rd["onboard"]["pos"][2], "qf": rd["onboard"]["qf"]}
@@ -386,6 +420,96 @@ def parse_simple(line, tag, tag_height):
             "lsq": lsq, "rms": rms, "mode": mode, "excluded": excl,
             "excluded_labels": [ANCHOR_NAMES.get(anchors[i]["id"], anchors[i]["id"])
                                 for i in excl]}
+
+
+# --------------------------------------------------------------------------- #
+# This branch's protocol: one $RNG record per tag-anchor pair, section 9.4.
+#
+#   $RNG,<sfn>,<frame>,0x<tag>,0x<anchor>,<slot>,<d_mm>,<tof_ps>,<rxp>,<fpp>,
+#        0x<flags>,<t_us>*<cs>
+#
+# Unlike the stock firmwares, a line is one PAIR, not one fix, so records are
+# accumulated by superframe number and flushed when the sfn moves on. Two
+# things this protocol gives that the closed PANS library could not: a real
+# time of flight in picoseconds, and a genuine measured RSSI -- rxp/fpp come
+# from dwt_readdiagnostics() on the DW1000 itself, not a path-loss model.
+RNG_RE = re.compile(
+    r"\$RNG,(\d+),(\d+),0x([0-9A-Fa-f]{4}),0x([0-9A-Fa-f]{4}),(\d+),"
+    r"(-?\d+),(\d+),(-?[\d.]+),(-?[\d.]+),0x([0-9A-Fa-f]+),(\d+)")
+
+# Section 9.4 flag bits.
+F_SS_FALLBACK, F_NLOS, F_RESP_LOST = 0x01, 0x02, 0x04
+F_REPORT_LOST, F_DESYNC, F_HASH_MISMATCH = 0x08, 0x10, 0x20
+
+_RNG_ACC = {}          # tag -> {"sfn": n, "anchors": [...], "device_us": us}
+
+
+def _flag_names(f):
+    out = []
+    for bit, nm in ((F_SS_FALLBACK, "ss_fallback"), (F_NLOS, "nlos"),
+                    (F_RESP_LOST, "resp_lost"), (F_REPORT_LOST, "report_lost"),
+                    (F_DESYNC, "desync"), (F_HASH_MISMATCH, "hash_mismatch")):
+        if f & bit:
+            out.append(nm)
+    return out
+
+
+def parse_rng(line, tag, tag_height, coords):
+    """Accumulate $RNG pairs into one reading per superframe.
+
+    Returns a reading when a superframe completes, else None."""
+    m = RNG_RE.search(line)
+    if not m:
+        return None
+    (sfn, _frame, _tag_id, anchor_id, slot, d_mm, tof_ps,
+     rxp, fpp, flags, dev_us) = m.groups()
+    sfn, slot, flags = int(sfn), int(slot), int(flags, 16)
+
+    acc = _RNG_ACC.get(tag)
+    done = None
+    if acc is not None and acc["sfn"] != sfn:
+        done = acc                      # the previous superframe is complete
+    if done is not None or acc is None:
+        acc = {"sfn": sfn, "anchors": [], "device_us": None}
+        _RNG_ACC[tag] = acc
+    acc["sfn"] = sfn
+    acc["device_us"] = unwrap_us(tag, int(dev_us))
+
+    # A lost Response carries no distance; keep it out of the fix but report it.
+    if not (flags & F_RESP_LOST):
+        # Anchor coordinates come from the survey file, keyed the way
+        # uwb_anchors.json is: slot 0 is anchor "1".
+        pos = coords.get(str(slot + 1))
+        acc["anchors"].append({
+            "id": anchor_id.upper(),
+            "slot": slot,
+            "range": int(d_mm) / 1000.0,
+            "tof_ps": int(tof_ps),
+            "rxp_dbm": float(rxp),
+            "fpp_dbm": float(fpp),
+            "flags": flags,
+            "flag_names": _flag_names(flags),
+            "pos": pos,
+            "dist_qf": None,
+        })
+    else:
+        acc.setdefault("lost", []).append(slot)
+
+    if done is None:
+        return None
+
+    rd = {"t": time.time(), "device_us": done["device_us"],
+          "anchors": done["anchors"], "fw": "dstwr", "sfn": done["sfn"],
+          "lost_slots": done.get("lost", [])}
+
+    # A 2D fix needs three ranges against known positions; below that the
+    # ranges are the whole output and no position is claimed.
+    usable = [a for a in rd["anchors"] if a["pos"]]
+    if len(usable) >= 3:
+        lsq, rms, mode, excl = robust_multilaterate(
+            [a["pos"] for a in usable], [a["range"] for a in usable], tag_height)
+        rd.update({"lsq": lsq, "rms": rms, "mode": mode, "excluded": excl})
+    return rd
 
 
 def parse_lec(line, tag_height):
@@ -476,30 +600,37 @@ def expected_hz(rate):
         return None
 
 
-def tag_thread(device, name, tag_height, stop, pub=None, rate=None):
+def tag_thread(device, name, tag_height, stop, pub=None, rate=None,
+               coords=None):
     seq = 0
     last_status = 0.0
     while not stop.is_set():
         try:
             ser = serial.Serial(device, 115200, timeout=0.3)
             time.sleep(0.4)
-            if not enter_shell(ser):
-                raise RuntimeError("no dwm> prompt")
 
-            # Two firmwares emit two formats. A tag running the dwm-simple user
-            # app streams "T:<us> ... DIST0:0x..." unprompted; the stock firmware needs
-            # `lec` turning on -- and `lec` TOGGLES, so blindly sending it can
-            # switch off a stream a previous run left running. Listen first.
+            # Listen before writing anything. This branch's firmware streams
+            # $RNG unprompted and has no dwm> shell at all -- the double-Enter
+            # that enters the PANS shell would just be stray bytes in its
+            # command parser -- so the shell is only entered if no $RNG stream
+            # appears and we are therefore talking to a PANS build.
             buf = ""
             fw = None
             deadline = time.time() + 3.0
             while time.time() < deadline and fw is None:
                 buf += ser.read(4096).decode(errors="replace")
-                if SIMPLE_RE.search(buf):
+                if "$RNG," in buf or "$I,fw=" in buf:
+                    fw = "dstwr"
+                elif SIMPLE_RE.search(buf):
                     fw = "dwm-simple"
                 elif "DIST," in buf:
                     fw = "stock"
+
             if fw is None:
+                if not enter_shell(ser):
+                    raise RuntimeError("no $RNG stream and no dwm> prompt")
+                # `lec` TOGGLES, so blindly sending it can switch off a stream a
+                # previous run left running.
                 send(ser, "lec")
                 deadline = time.time() + 4
                 while time.time() < deadline and fw is None:
@@ -512,7 +643,10 @@ def tag_thread(device, name, tag_height, stop, pub=None, rate=None):
                     raise RuntimeError("no range stream (tried enabling lec)")
             print(f"  {name}: firmware = {fw}")
 
-            if rate:
+            if rate and fw == "dstwr":
+                print(f"  {name}: --rate ignored on dstwr firmware "
+                      f"(use $SET,rate_div,N instead)")
+            elif rate:
                 apply_rate(ser, name, rate)
             # Watchdog state. A soft reset of the nRF52 leaves the USB link up
             # (the J-Link OB is a separate chip), so no reconnect fires and the
@@ -529,8 +663,12 @@ def tag_thread(device, name, tag_height, stop, pub=None, rate=None):
                 buf += ser.read(4096).decode(errors="replace")
                 while "\n" in buf:
                     line, buf = buf.split("\n", 1)
-                    rd = (parse_simple(line, name, tag_height) if fw == "dwm-simple"
-                          else parse_lec(line, tag_height))
+                    if fw == "dstwr":
+                        rd = parse_rng(line, name, tag_height, coords or {})
+                    elif fw == "dwm-simple":
+                        rd = parse_simple(line, name, tag_height)
+                    else:
+                        rd = parse_lec(line, tag_height)
                     if rd:
                         with STATE_LOCK:
                             STATE["tags"][name].update(rd)
@@ -538,8 +676,10 @@ def tag_thread(device, name, tag_height, stop, pub=None, rate=None):
                             note_hit(name, None, rd["t"])
                             for a in rd["anchors"]:
                                 note_hit(name, a["id"], rd["t"], a["range"])
+                                prev = STATE["anchors"].get(a["id"], {})
                                 STATE["anchors"][a["id"]] = {
-                                    "pos": a["pos"], "last": rd["t"]}
+                                    "pos": a["pos"] or prev.get("pos"),
+                                    "last": rd["t"]}
                         if pub:
                             seq += 1
                             pub.publish_reading(name, rd, seq)
@@ -553,7 +693,7 @@ def tag_thread(device, name, tag_height, stop, pub=None, rate=None):
                                     "host_time": round(rd["t"], 3)})
 
                 # --- rate watchdog ---
-                if rate and time.time() >= wd_next:
+                if rate and fw != "dstwr" and time.time() >= wd_next:
                     want = expected_hz(rate)
                     with STATE_LOCK:
                         seen = rates(time.time()).get(name, {}).get("tag_hz", 0.0)
@@ -675,7 +815,8 @@ def main():
             continue
         print(f"  reading {name} on {p.device}")
         t = threading.Thread(target=tag_thread,
-                             args=(p.device, name, a.tag_height, stop, PUB, a.rate),
+                             args=(p.device, name, a.tag_height, stop, PUB, a.rate,
+                                   planned),
                              daemon=True)
         t.start(); threads.append(t)
     if not threads:
