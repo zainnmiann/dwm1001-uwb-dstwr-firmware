@@ -77,6 +77,36 @@ on `position/<tag>` under `detail`.
 The live view is at `http://<host>:8765/` once running (or whatever
 `--bind`/`--port` you chose).
 
+## Provisioning
+
+A board's configuration lives only in its own flash, set over serial, so a
+reflash or an erase loses it. `provision.py` is the record of the working
+setup and re-applies it:
+
+```sh
+./provision.py --verify     # report each board's state, hash and eq 12/13/14
+./provision.py --dry-run    # show what would be sent, change nothing
+./provision.py              # provision every attached board
+```
+
+Edit the `BOARDS`, `TIMING` and `LOCAL` tables at the top rather than the
+code. `TIMING` is the hashed set -- every node must carry identical values or
+its Polls are rejected -- so **all boards have to be attached together**; the
+script compares the hash across them at the end and says so if they diverge.
+
+The timing there is not the specification's default. Its own values (`T_r0`
+400, `dr` 300, `T_p0` 400) proved too aggressive for real DW1000 SPI at 8 MHz:
+slot 0 could not arm its Response at all and the Report ran 82 us over budget,
+which suppressed DS-TWR entirely in favour of the single-sided fallback. The
+figures in `TIMING` came from `$MEASURE` and `$TABLEB` on the boards
+themselves (section 13 step 5), against measured costs of 313 us to arm a
+Response and 682 us to arm a Report. `frame_dur_us` is not hardcoded -- the
+script asks `$TABLEB` what equation (14) requires and sets that.
+
+`ant_delay_tx/rx` is Decawave's generic 16436, not a per-board calibration.
+Until section 13 step 1 is done, pairs at one physical distance still read
+0.81-1.00 m.
+
 Two lighter viewers, both in this directory:
 
 ```sh
