@@ -462,11 +462,12 @@ static int check_slot_equivalence(const cfg_t *base)
 
             /* The two receive windows and the exchange deadline. */
             {
+                /* A bounded capture allowance, not guard_us/2: the window
+                 * must not eat the Final's arming budget -- see slots.c. */
                 uint32_t want = t
                     + us_to_hi32(c.resp_base_us
-                                 + (uint32_t)(nr - 1u) * c.resp_pitch_us)
-                    + ns_to_hi32(timing_air_resp_ns(&c))
-                    + us_to_hi32(c.guard_us / 2u);
+                                 + (uint32_t)(nr - 1u) * c.resp_pitch_us + 8u)
+                    + ns_to_hi32(timing_air_resp_ns(&c));
                 if (slot_resp_window_end_hi32(&c, t) != want) { bad++; }
 
                 want = t

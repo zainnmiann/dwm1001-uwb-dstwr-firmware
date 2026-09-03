@@ -93,6 +93,7 @@ static uint32_t g_loss_x100;
 static uint32_t g_proc_us = 60u;
 static uint64_t g_rng = 0x2545F4914F6CDD1DULL;
 static uint32_t g_collisions, g_tx_late, g_txs;
+static uint32_t g_late_kind[4];   /* Poll, Resp, Final, Report */
 static uint32_t g_tr, g_tr2;
 #define TR(...) do { if (getenv("HARNESS_TRACE") && g_tr++ < 60) { printf("    "); printf(__VA_ARGS__); } } while (0)
 
@@ -267,6 +268,24 @@ static void handle_tx(node_t *n, const ipc_req_t *rq)
     if (launch <= n->t_g)
     {
         g_tx_late++;
+        /* Which message missed, and by how much: without this the counter
+         * says only that something was late, and the obvious suspect is not
+         * always the culprit. */
+        if (rq->len >= COMMON_LEN)
+        {
+            uint8_t  ty = MSG_TYPE(rq->buf[IDX_TYPEVER]);
+            unsigned k  = (ty == MSG_POLL)  ? 0u : (ty == MSG_RESP) ? 1u
+                        : (ty == MSG_FINAL) ? 2u : 3u;
+
+            g_late_kind[k]++;
+            if (getenv("HARNESS_LATE") && g_late_kind[k] < 4u)
+            {
+                printf("    LATE %-6s n%02u short by %.1f us\n",
+                       (k==0)?"Poll":(k==1)?"Resp":(k==2)?"Final":"Report",
+                       (unsigned)(n - g_n),
+                       (double)(n->t_g - launch) / DTU_PER_NS / 1000.0);
+            }
+        }
         reply(n, REP_TX_LATE);
         return;
     }
@@ -681,10 +700,16 @@ static int report(void)
         printf("    FAIL %u $RNG lines carried anchor_id 0x0000\n", g_zero_anchor);
         fail = 1;
     }
-    if (g_loss_x100 == 0u && g_tx_late)
+    /* Asserted in both scenarios now. It used to be gated on loss == 0
+     * because equation (2)'s fallback left only 4 us to arm the Final, so any
+     * lost last Response was guaranteed tx_late; slots.c now gives that branch
+     * the same margin as the normal path, so a late transmit is a real defect
+     * whether or not frames are being dropped. */
+    if (g_tx_late)
     {
-        printf("    FAIL %u tx_late with no loss and proc_us=%u\n",
-               g_tx_late, g_proc_us);
+        printf("    FAIL %u tx_late (proc_us=%u): Poll %u, Resp %u, "
+               "Final %u, Report %u\n", g_tx_late, g_proc_us,
+               g_late_kind[0], g_late_kind[1], g_late_kind[2], g_late_kind[3]);
         fail = 1;
     }
     return fail;

@@ -1,6 +1,15 @@
 #include "slots.h"
 #include "timing.h"
 
+/* How late the last Response may still arrive and be captured.
+ *
+ * Two bounded terms: the one-way flight time, which the estimators cap at the
+ * ~1000 m plausibility band (3.3 us), and the responder's clock error over the
+ * Response group, 40 ppm of roughly 4 ms (0.2 us). 8 us covers both with room
+ * to spare while leaving equation (2) nearly all of its Dr - air(Resp) arming
+ * budget. */
+#define RESP_CAPTURE_SLACK_US   8u
+
 uint32_t slot_resp_hi32(const cfg_t *c, uint32_t poll_rx_hi32, uint8_t slot)
 {
     /* Equation (1). */
@@ -32,11 +41,27 @@ uint32_t slot_final_hi32(const cfg_t *c, uint32_t poll_hi32,
 
 uint32_t slot_resp_window_end_hi32(const cfg_t *c, uint32_t poll_hi32)
 {
+    /* Ends where the last Response can no longer still be arriving, and not a
+     * microsecond later: everything past that instant is the Final's arming
+     * budget, which equation (2) sizes as Dr - air(Resp) = 104 us at the
+     * defaults.
+     *
+     * This used to carry a further guard_us/2. That borrowed 100 of those 104
+     * us, so whenever the Response mask did not complete -- any lost Response,
+     * not just a lost last one -- the loop waited out the whole window and
+     * then had 4 us to build an 87-byte Final and arm it. Every such frame was
+     * tx_late. The guard belongs at the frame boundary, where equation (14)
+     * already spends T_g, not inside the Response group.
+     *
+     * Nothing is lost by trimming it: a Response is placed off the responder's
+     * own reception of the Poll, so its arrival spread is propagation plus a
+     * few ppm over ~4 ms -- microseconds, not a hundred of them. Found by the
+     * fork harness, which attributed all 37 late transmits to the Final. */
     return poll_hi32
          + us_to_hi32(c->resp_base_us
-                      + (uint32_t)(c->resp_count - 1u) * c->resp_pitch_us)
-         + ns_to_hi32(timing_air_resp_ns(c))
-         + us_to_hi32(c->guard_us / 2u);
+                      + (uint32_t)(c->resp_count - 1u) * c->resp_pitch_us
+                      + RESP_CAPTURE_SLACK_US)
+         + ns_to_hi32(timing_air_resp_ns(c));
 }
 
 uint32_t slot_report_window_end_hi32(const cfg_t *c, uint32_t final_hi32)
