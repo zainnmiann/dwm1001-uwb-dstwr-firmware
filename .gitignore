@@ -16,3 +16,4 @@ test/test_host
 # Simulator build output
 sim/sim
 sim/loop/harness
+sim/ui/viewer.html

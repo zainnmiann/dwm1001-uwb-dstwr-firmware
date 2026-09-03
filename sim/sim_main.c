@@ -47,6 +47,7 @@
 #include "ranging.h"
 #include "proto.h"
 #include "slots.h"
+#include "sim_trace.h"
 
 #define N_TAGS          4u
 #define N_ANCH          12u
@@ -111,6 +112,10 @@ static tag_t  T[N_TAGS];
 static anch_t A[N_ANCH];
 static uint32_t g_loss_x100;
 static uint32_t g_trace;
+static const char *g_trace_base;      /* --trace= prefix, or NULL */
+static uint32_t    g_trace_win = 20u;
+static bool        g_live;
+static double      g_realtime;
 static uint32_t g_trace2;
 
 /* --- transmission log, for the slot-overlap check ------------------------- */
@@ -118,6 +123,17 @@ typedef struct { int64_t s, e; int who; const char *kind; } txr_t;
 
 static txr_t  *g_tx;
 static size_t  g_tx_n, g_tx_cap;
+
+static void tx_log(int64_t s, int64_t e, int who, const char *kind);
+
+/* Kind string -> the trace's enum, so one call site feeds both. */
+static tkind_t tk_of(const char *kind)
+{
+    if (!strcmp(kind, "Poll"))  { return TK_POLL; }
+    if (!strcmp(kind, "Resp"))  { return TK_RESP; }
+    if (!strcmp(kind, "Final")) { return TK_FINAL; }
+    return TK_REPORT;
+}
 
 static void tx_log(int64_t s, int64_t e, int who, const char *kind)
 {
@@ -130,6 +146,15 @@ static void tx_log(int64_t s, int64_t e, int who, const char *kind)
     g_tx[g_tx_n].s = s; g_tx[g_tx_n].e = e;
     g_tx[g_tx_n].who = who; g_tx[g_tx_n].kind = kind;
     g_tx_n++;
+
+    if (trace_active())
+    {
+        uint32_t node = (who >= 100) ? (uint32_t)(N_TAGS + (who - 100))
+                                     : (uint32_t)who;
+        uint32_t slot = (who >= 100) ? (uint32_t)(who - 100) : 0u;
+
+        trace_tx(s, e, node, tk_of(kind), slot, 0u);
+    }
 }
 
 static int tx_cmp(const void *a, const void *b)
@@ -253,6 +278,7 @@ static void run_frame(unsigned ti, int64_t poll_g, uint32_t sfn)
     if (last < 0)
     {
         t->frames_lost++;               /* section 11: whole frame lost */
+        trace_frame_lost(poll_g, ti, sfn);
         return;
     }
 
@@ -322,6 +348,16 @@ static void run_frame(unsigned ti, int64_t poll_g, uint32_t sfn)
             t->ranges[s]++;
             t->err_sum_mm[s] += err;
             if (fabs(err) > t->err_max_mm[s]) { t->err_max_mm[s] = fabs(err); }
+
+            if (trace_active())
+            {
+                uint64_t six[6] = { poll_tx_w, poll_rx_w[s], resp_tx_w[s],
+                                    resp_rx_w[s], final_tx_w,
+                                    WIRE(final_rx_full) };
+
+                trace_range(rep_g, ti, (uint32_t)(0x0101u + s), s, sfn,
+                            d_mm, d_true, ranging_dtu_to_ps(tau), 0u, six);
+            }
         }
     }
 
@@ -351,6 +387,18 @@ static void run_frame(unsigned ti, int64_t poll_g, uint32_t sfn)
                 o->alarm_g   = sim_global_from_hi32(&o->clk,
                                                     o->sync.t_next_hi32, rx_g);
                 o->has_alarm = true;
+            }
+            if (trace_active())
+            {
+                trace_sync_ev(rx_g, s, sync_state_str(o->sync.state),
+                              (o->sync.n_rearm > re0) ? "rearm"
+                              : (o->sync.n_drift_reset > dr0) ? "drift_reset"
+                              : "none",
+                              o->sync.last_err_us, o->sync.beta_ppb,
+                              (uint32_t)(((int)t->cfg.frame_index
+                                          <= (int)o->cfg.frame_index)
+                                         ? (o->cfg.frame_index - t->cfg.frame_index)
+                                         : 0));
             }
             if (getenv("SIM_TRACE2") && g_trace2++ < 24)
             {
@@ -462,6 +510,18 @@ static int scenario(const char *name, bool drift, uint32_t loss_x100,
     g_trace2    = 0;
     s_rng       = 0x2545F4914F6CDD1DULL;
 
+    /* One trace per scenario, so the UI can show the clean baseline and the
+     * lossy run side by side rather than only whichever ran first. */
+    if (g_trace_base)
+    {
+        char path[512];
+
+        snprintf(path, sizeof(path), "%s.%s.json", g_trace_base,
+                 loss_x100 ? "realistic" : "ideal");
+        trace_open(path, g_trace_win);
+    }
+    if (g_live) { trace_live(g_realtime); }
+
     printf("=== %s ===\n", name);
     printf("  clocks: %s   frame loss: %.2f%% per hop\n",
            drift ? "static offset + thermal drift" : "static offset only",
@@ -514,6 +574,25 @@ static int scenario(const char *name, bool drift, uint32_t loss_x100,
             printf("  FAIL node %u config invalid: %d %s %s\n", i, v, k, r);
             return 1;
         }
+    }
+
+    if (trace_active())
+    {
+        unsigned k;
+
+        trace_meta(base, name, N_TAGS, N_ANCH, 0x2545F4914F6CDD1DULL,
+                   SUPERFRAMES, loss_x100);
+        for (k = 0; k < N_TAGS; k++)
+        {
+            trace_node(k, ROLE_INIT, T[k].cfg.node_id, T[k].x, T[k].y,
+                       T[k].clk.ppm, T[k].clk.drift_ppm, T[k].clk.drift_hz);
+        }
+        for (k = 0; k < N_ANCH; k++)
+        {
+            trace_node(N_TAGS + k, ROLE_RESP, A[k].cfg.node_id, A[k].x, A[k].y,
+                       A[k].clk.ppm, A[k].clk.drift_ppm, A[k].clk.drift_hz);
+        }
+        trace_nodes_done();
     }
 
     sim_bind_clock(&T[0].clk, 0);
@@ -605,8 +684,14 @@ static int scenario(const char *name, bool drift, uint32_t loss_x100,
         T[best].alarm_g = sim_global_from_hi32(&T[best].clk,
                                                T[best].sync.t_next_hi32, now);
         note_state(&T[best], now);
-        if (best == 0) { sfn++; }
+        if (best == 0)
+        {
+            sfn++;
+            if (trace_active()) { trace_superframe(sfn, now); }
+        }
+        if (trace_active()) { trace_live_draw(now, false); }
     }
+    if (trace_active()) { trace_live_draw(now, true); }
 
     /* ---------------- per tag per anchor ---------------- */
     printf("\n  tag  polls  lost  min/anch  max/anch  spread  peak err   bias   state\n");
@@ -763,6 +848,9 @@ static int scenario(const char *name, bool drift, uint32_t loss_x100,
                            (double)(g_tx[j].e - g_tx[k].s) / DTU_PER_NS / 1000.0);
                 }
                 if (g_tx[j].e - g_tx[k].s > worst) { worst = g_tx[j].e - g_tx[k].s; }
+                trace_collision(g_tx[k].s, (uint32_t)g_tx[j].who,
+                                (uint32_t)g_tx[k].who,
+                                (double)(g_tx[j].e - g_tx[k].s) / DTU_PER_NS / 1000.0);
                 clashes++;
             }
         }
@@ -776,15 +864,76 @@ static int scenario(const char *name, bool drift, uint32_t loss_x100,
         }
     }
 
+    if (trace_active())
+    {
+        unsigned a, b;
+
+        for (a = 0; a < N_TAGS; a++)
+        {
+            for (b = 0; b < N_ANCH; b++)
+            {
+                double span = (double)(T[a].last_poll_g - T[a].first_poll_g)
+                            / SIM_DTU_PER_S_D;
+                double hz   = (span > 0.0)
+                            ? ((double)T[a].ranges[b] / span) : 0.0;
+                double bias = T[a].ranges[b]
+                            ? T[a].err_sum_mm[b] / (double)T[a].ranges[b] : 0.0;
+
+                trace_summary_pair(a, b, T[a].ranges[b], hz, bias,
+                                   T[a].err_max_mm[b]);
+            }
+        }
+        for (a = 0; a < N_TAGS; a++)
+        {
+            double span = (double)(T[a].last_poll_g - T[a].first_poll_g)
+                        / SIM_DTU_PER_S_D;
+
+            trace_summary_tag(a, T[a].polls,
+                              (span > 0.0) ? ((double)(T[a].polls - 1u) / span) : 0.0,
+                              (int64_t)((double)(T[a].gap_max - T[a].gap_min)
+                                        / DTU_PER_NS),
+                              sync_state_str(T[a].sync.state),
+                              T[a].sync.n_rearm, T[a].sync.n_freerun,
+                              T[a].sync.n_dup, T[a].sync.n_drift_reset,
+                              T[a].sync.last_err_us);
+        }
+        trace_summary_run((uint32_t)g_tx_n, 0u, 0.0, fail == 0);
+        trace_close();
+    }
+
     printf("  %s\n\n", fail ? "FAIL" : "PASS");
     return fail;
 }
 
 /* ------------------------------------------------------------------------- */
-int main(void)
+int main(int argc, char **argv)
 {
-    cfg_t base;
-    int   fail = 0;
+    cfg_t       base;
+    int         fail = 0;
+    const char *trace_path = NULL;
+    uint32_t    trace_win  = 20u;
+    bool        live       = false;
+    double      realtime   = 0.0;
+    int         i;
+
+    for (i = 1; i < argc; i++)
+    {
+        if      (!strncmp(argv[i], "--trace=", 8))        { trace_path = argv[i] + 8; }
+        else if (!strncmp(argv[i], "--trace-window=", 15)) { trace_win = (uint32_t)atoi(argv[i]+15); }
+        else if (!strcmp(argv[i], "--live"))              { live = true; }
+        else if (!strncmp(argv[i], "--realtime=", 11))    { live = true; realtime = atof(argv[i]+11); }
+        else if (!strcmp(argv[i], "--realtime"))          { live = true; realtime = 1.0; }
+        else if (!strcmp(argv[i], "--help"))
+        {
+            printf("usage: sim [--trace=FILE] [--trace-window=N] "
+                   "[--live] [--realtime[=MULT]]\n");
+            return 0;
+        }
+    }
+    g_trace_base = trace_path;
+    g_trace_win  = trace_win;
+    g_live       = live;
+    g_realtime   = realtime;
 
     cfg_defaults(&base);
     base.resp_count    = (uint8_t)N_ANCH;
