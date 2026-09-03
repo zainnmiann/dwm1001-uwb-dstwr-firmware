@@ -18,12 +18,18 @@ with a small live-view UI.
 
 ## Compatibility
 
-This bridge's serial parser targets the line framing the tags' **current**
-on-board application emits (`DIST,...` CSV lines, or `T:<us> POS:...
-DISTn:...` lines) — **not** this branch's `$RNG,...` protocol. Until the tags
-are reflashed with the firmware in this branch, `localize.py` is what
-actually talks to them; it will not recognize `$RNG` lines. Updating the
-parser for the new protocol is a follow-up, not done here.
+The parser handles three line formats and picks one by listening before it
+writes anything:
+
+- `$RNG,...` — this branch's protocol (`fw = dstwr`). One record per
+  tag-anchor **pair**, accumulated by superframe.
+- `T:<us> POS:... DISTn:...` — the dwm-simple on-board app.
+- `DIST,...` — stock PANS, via `lec`.
+
+This firmware has no `dwm>` shell, so the shell is only entered when no `$RNG`
+stream appears; sending the double-Enter to it would just be stray bytes in
+its command parser. `--rate` and the rate watchdog are PANS shell commands and
+are skipped on `dstwr` — use `$SET,rate_div,N` on the tag instead.
 
 ## Running it
 
@@ -42,20 +48,52 @@ MQTT topics published:
 
 ```
 uwb/ranging/<tag>/<anchor>   one message per tag-anchor range
-uwb/position/<tag>           this bridge's own least-squares fix, plus the
-                              tag's on-board fix if available
+uwb/position/<tag>           per-superframe metadata, plus a least-squares fix
+                              when three or more surveyed anchors were heard
 uwb/status/<tag>             per-tag health (observed rate, connection state)
 ```
+
+`ranging` carries six fields and nothing else, so it stays a plain stream of
+raw ranges:
+
+```json
+{"tag_label":"TAG1","anchor_label":"ANC1","range_m":0.98,"rssi":-78.5,
+ "timestamp_sent":1099116851,"timestamp_received":1788439680.999}
+```
+
+**Order.** Each tag owns its own port and thread, so publishing from those
+threads would interleave the tags by whichever port was read first — unrelated
+to the order the exchanges happened on air. Section 3 gives frame *k* of every
+superframe to initiator *k*, so readings are buffered and released in
+`(superframe, frame)` order: tag frame 0's ranges, then frame 1's, then the
+next superframe. A superframe is released as soon as every initiator has
+reported it, otherwise after `SEQ_HOLD` (250 ms), so one tag going quiet
+delays the stream rather than stalling it.
+
+Everything that used to ride on `ranging` — superframe number, frame index,
+lost slots, time of flight, first-path power, and the DS-TWR/SS-TWR flags — is
+on `position/<tag>` under `detail`.
 
 The live view is at `http://<host>:8765/` once running (or whatever
 `--bind`/`--port` you chose).
 
+Two lighter viewers, both in this directory:
+
+```sh
+./watch_ranges.py     # straight off serial -- no broker, no HTTP
+./watch_mqtt.py       # off the broker; --raw prints every message
+```
+
 ## Notes
 
-- `rssi` in each ranging message is a **calculated estimate** from range and
-  the current firmware's own quality factor (a free-space path-loss model) —
-  not a hardware measurement. No radio on this hardware exposes true
-  per-range signal strength today.
+- `rssi` is a **real measurement** on the `dstwr` firmware: it is the received
+  power the DW1000 itself reports via `dwt_readdiagnostics()`, carried in the
+  protocol's Report. On the PANS builds, where no such register is exposed,
+  it falls back to the free-space path-loss estimate in
+  `estimate_rssi_dbm()`; `position/<tag>` distinguishes the two.
+- `timestamp_received` is when this host parsed the line, and the host reads
+  serial in chunks — a burst of superframes can share one parse instant.
+  `timestamp_sent` is the tag's own clock and is the better epoch.
 - `timestamp_sent` is the tag's own on-board clock at the moment of the fix;
   `timestamp_received` is when this host parsed the line.
 - To run on a new device: copy this directory over, then point

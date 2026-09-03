@@ -314,39 +314,41 @@ class Mqtt:
             # estimate of when the fix was taken (dwm_systime_us_get(), wraps
             # ~35 min, unwrapped to monotonic here; not available on stock
             # stock lec). timestamp_received is when this machine parsed the line.
-            msg_r = {
+            # Deliberately the six fields and nothing else. Everything a
+            # consumer might otherwise want -- superframe number, frame index,
+            # which slots were lost, the tof, the DS-TWR/SS-TWR distinction --
+            # rides on position/<tag> instead, so this topic stays a plain
+            # stream of raw ranges.
+            #
+            # rssi is a real measurement on this firmware (rxp from
+            # dwt_readdiagnostics on the DW1000); the estimate_rssi_dbm()
+            # path-loss model is only used for the PANS builds that expose no
+            # such register.
+            rssi = (a["rxp_dbm"] if a.get("rxp_dbm") is not None
+                    else estimate_rssi_dbm(a["range"], a.get("dist_qf")))
+            self.emit(f"ranging/{tag}/{label}", {
                 "tag_label": tag,
                 "anchor_label": label,
                 "range_m": round(a["range"], 3),
+                "rssi": round(rssi, 1),
                 "timestamp_sent": rd.get("device_us"),
                 "timestamp_received": round(rd["t"], 3),
-            }
-            if a.get("rxp_dbm") is not None:
-                # A real measurement on this firmware: rxp/fpp come from
-                # dwt_readdiagnostics() on the DW1000. rssi_estimated stays
-                # false so a consumer can tell it apart from the path-loss
-                # figure the PANS builds have to fall back on.
-                msg_r.update({
-                    "rssi": round(a["rxp_dbm"], 1),
-                    "rssi_estimated": False,
-                    "first_path_dbm": round(a["fpp_dbm"], 1),
-                    "tof_ps": a.get("tof_ps"),
-                    "slot": a.get("slot"),
-                    "flags": a.get("flags"),
-                    "flag_names": a.get("flag_names"),
-                })
-            else:
-                msg_r.update({
-                    "rssi": round(estimate_rssi_dbm(a["range"],
-                                                    a.get("dist_qf")), 1),
-                    "rssi_estimated": True,
-                })
-            self.emit(f"ranging/{tag}/{label}", msg_r)
+            })
         msg = {"tag_label": tag, "n_anchors": len(rd["anchors"]),
                "host_time": round(rd["t"], 3), "device_us": rd.get("device_us"),
                "fw": rd.get("fw", "stock"), "seq": seq}
         if rd.get("sfn") is not None:
             msg["sfn"] = rd["sfn"]
+        if rd.get("frame") is not None:
+            msg["frame"] = rd["frame"]
+        det = [{"anchor": ANCHOR_NAMES.get(x["id"], x["id"]),
+                "slot": x.get("slot"), "tof_ps": x.get("tof_ps"),
+                "first_path_dbm": (round(x["fpp_dbm"], 1)
+                                   if x.get("fpp_dbm") is not None else None),
+                "flags": x.get("flags"), "flag_names": x.get("flag_names")}
+               for x in rd["anchors"] if x.get("tof_ps") is not None]
+        if det:
+            msg["detail"] = det
         if rd.get("lost_slots"):
             msg["lost_slots"] = rd["lost_slots"]
         if rd.get("onboard"):
@@ -359,6 +361,80 @@ class Mqtt:
                           "mode": rd.get("mode")}
         if len(msg) > 4:
             self.emit(f"position/{tag}", msg)
+
+
+# --------------------------------------------------------------------------- #
+# TDMA-order sequencer
+#
+# Each tag owns its own serial port and its own thread, so publishing straight
+# from those threads interleaves the two tags in whatever order the ports
+# happened to be read -- which has nothing to do with the order the exchanges
+# actually occurred on air. Section 3 gives frame k of every superframe to
+# initiator k, so the true order is (superframe, frame index).
+#
+# Readings are therefore buffered by superframe and released in frame order. A
+# superframe goes out as soon as every expected initiator has reported it, and
+# otherwise after SEQ_HOLD -- so one tag going quiet delays the stream by that
+# much rather than stalling it. Superframes are released in ascending order and
+# a late arrival for one already released is dropped, since emitting it after
+# its successors would defeat the point.
+# --------------------------------------------------------------------------- #
+SEQ_HOLD = 0.25            # seconds to wait for a missing initiator
+SEQ_LOCK = threading.Lock()
+SEQ_BUF = {}               # sfn -> {"t": first_seen, "frames": {frame: (tag, rd)}}
+SEQ_LAST = -1              # highest superframe already released
+SEQ_LATE = 0               # dropped for arriving after their turn
+SEQ_N = 1                  # how many initiators to expect
+
+
+def seq_expect(n):
+    global SEQ_N
+    SEQ_N = max(1, n)
+
+
+def seq_submit(tag, rd):
+    """Buffer one initiator's completed superframe."""
+    global SEQ_LATE
+    sfn = rd.get("sfn")
+    if sfn is None:
+        return False                       # not this protocol; publish directly
+    with SEQ_LOCK:
+        if sfn <= SEQ_LAST:
+            SEQ_LATE += 1
+            return True
+        e = SEQ_BUF.setdefault(sfn, {"t": time.time(), "frames": {}})
+        e["frames"][rd.get("frame", 0)] = (tag, rd)
+    return True
+
+
+def seq_drain(pub, seq_counter):
+    """Release every superframe that is complete or has waited long enough."""
+    global SEQ_LAST
+    now = time.time()
+    out = []
+    with SEQ_LOCK:
+        for sfn in sorted(SEQ_BUF):
+            e = SEQ_BUF[sfn]
+            if len(e["frames"]) < SEQ_N and (now - e["t"]) < SEQ_HOLD:
+                break                      # still filling, and in order
+            for frame in sorted(e["frames"]):
+                out.append(e["frames"][frame])
+            del SEQ_BUF[sfn]
+            SEQ_LAST = sfn
+    for tag, rd in out:
+        seq_counter[0] += 1
+        pub.publish_reading(tag, rd, seq_counter[0])
+    return len(out)
+
+
+def seq_thread(pub, stop):
+    counter = [0]
+    while not stop.is_set():
+        try:
+            seq_drain(pub, counter)
+        except Exception as e:
+            print(f"  sequencer: {e}")
+        time.sleep(0.01)
 
 
 # --------------------------------------------------------------------------- #
@@ -461,18 +537,19 @@ def parse_rng(line, tag, tag_height, coords):
     m = RNG_RE.search(line)
     if not m:
         return None
-    (sfn, _frame, _tag_id, anchor_id, slot, d_mm, tof_ps,
+    (sfn, frame, _tag_id, anchor_id, slot, d_mm, tof_ps,
      rxp, fpp, flags, dev_us) = m.groups()
-    sfn, slot, flags = int(sfn), int(slot), int(flags, 16)
+    sfn, frame, slot, flags = int(sfn), int(frame), int(slot), int(flags, 16)
 
     acc = _RNG_ACC.get(tag)
     done = None
     if acc is not None and acc["sfn"] != sfn:
         done = acc                      # the previous superframe is complete
     if done is not None or acc is None:
-        acc = {"sfn": sfn, "anchors": [], "device_us": None}
+        acc = {"sfn": sfn, "frame": frame, "anchors": [], "device_us": None}
         _RNG_ACC[tag] = acc
     acc["sfn"] = sfn
+    acc["frame"] = frame
     acc["device_us"] = unwrap_us(tag, int(dev_us))
 
     # A lost Response carries no distance; keep it out of the fix but report it.
@@ -500,7 +577,7 @@ def parse_rng(line, tag, tag_height, coords):
 
     rd = {"t": time.time(), "device_us": done["device_us"],
           "anchors": done["anchors"], "fw": "dstwr", "sfn": done["sfn"],
-          "lost_slots": done.get("lost", [])}
+          "frame": done["frame"], "lost_slots": done.get("lost", [])}
 
     # A 2D fix needs three ranges against known positions; below that the
     # ranges are the whole output and no position is claimed.
@@ -681,8 +758,11 @@ def tag_thread(device, name, tag_height, stop, pub=None, rate=None,
                                     "pos": a["pos"] or prev.get("pos"),
                                     "last": rd["t"]}
                         if pub:
-                            seq += 1
-                            pub.publish_reading(name, rd, seq)
+                            # Ordered by (superframe, frame) in the sequencer
+                            # rather than by which port was read first.
+                            if not seq_submit(name, rd):
+                                seq += 1
+                                pub.publish_reading(name, rd, seq)
                             if rd["t"] - last_status > 5:
                                 last_status = rd["t"]
                                 with STATE_LOCK:
@@ -821,6 +901,13 @@ def main():
         t.start(); threads.append(t)
     if not threads:
         raise SystemExit("no tags found among connected boards")
+
+    if PUB:
+        seq_expect(len(threads))
+        st = threading.Thread(target=seq_thread, args=(PUB, stop), daemon=True)
+        st.start(); threads.append(st)
+        print(f"  ordering the stream by (superframe, frame) across "
+              f"{len(threads) - 1} initiator(s)")
 
     srv = ThreadingHTTPServer((a.bind, a.port), Handler)
     shown = "127.0.0.1" if a.bind in ("127.0.0.1", "localhost") else a.bind
