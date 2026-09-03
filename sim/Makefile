@@ -8,7 +8,7 @@ CFLAGS  ?= -std=c11 -O1 -g -Wall -Wextra -I. -Istub -I$(SRC) -I$(VENDOR)
 # nclk_t layout and read drift_ppm where phase_dtu now lives.
 CFLAGS  += -MMD -MP
 
-OBJS := sim_main.o sim_radio.o cfg.o timing.o ranging.o sync.o
+OBJS := sim_main.o sim_radio.o cfg.o timing.o slots.o ranging.o sync.o
 
 all: run
 

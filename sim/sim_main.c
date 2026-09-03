@@ -5,8 +5,10 @@
  * WHAT THIS TESTS
  *   The distributed schedule and the estimators, using the firmware's own
  *   code: sync.c (section 6, equations 8 and 9), timing.c (the section 7 air
- *   model and equations 11-14), ranging.c (the section 4 estimators) and
- *   cfg.c (section 8 validation) are compiled unmodified and linked in.
+ *   model and equations 11-14), slots.c (the fixed-slot instants of
+ *   equations 1, 2 and 3 plus the receive windows and the exchange deadline),
+ *   ranging.c (the section 4 estimators) and cfg.c (section 8 validation) are
+ *   compiled unmodified and linked in.
  *
  *   Every transmit instant is derived through the real equations from
  *   timestamps taken on per-node clocks that each have their own crystal
@@ -24,9 +26,12 @@
  *
  * WHAT THIS DOES NOT TEST
  *   role_initiator.c and role_responder.c are blocking run-to-completion
- *   loops and are not linked here, so the receive-window arithmetic, the
- *   Response/Report mask handling and the serial surface are out of scope.
- *   This is a schedule and estimator test, not firmware-in-the-loop.
+ *   loops driven by radio_rx(), and their per-node state is file-scope static,
+ *   so 4 initiator instances cannot coexist in one process; they are not
+ *   linked. What remains out of scope is therefore the polling loop itself --
+ *   the SYS_STATUS waits, the RX re-arm sequence, the Response/Report mask
+ *   assembly and the serial surface. The arithmetic those loops used to hold
+ *   inline now lives in slots.c and IS exercised here.
  *   Antenna delay is zero on every node, so a recovered tau equals the true
  *   flight time up to device-time quantization.
  */
@@ -41,6 +46,7 @@
 #include "timing.h"
 #include "ranging.h"
 #include "proto.h"
+#include "slots.h"
 
 #define N_TAGS          4u
 #define N_ANCH          12u
@@ -162,9 +168,21 @@ static double dist_mm(double ax, double ay, double bx, double by)
  * timeline -- folding it through the 40-bit mask first loses the epoch, since
  * the counter wraps every 17.2 s. The mask belongs only on wire values, where
  * the estimator's own sub40() resolves the wrap. */
-static int64_t launch_full(int64_t ref_full, uint32_t off_hi32)
+/* Lift a firmware slot function's result back onto the unbounded timeline.
+ *
+ * The slot_* functions take and return 32-bit device time, which wraps every
+ * 17.2 s; the simulator needs the absolute instant. They are called with the
+ * genuine low 32 bits of the reference -- so the wraparound arithmetic inside
+ * them is exercised for real -- and the difference from that reference is a
+ * small positive hi32 delta that lifts cleanly.
+ *
+ * The DW1000 then ignores the low 9 bits of DX_TIME, so the launch lands on an
+ * even hi32 boundary, exactly as radio_tx_ts_from_hi32() reports it. */
+static int64_t launch_from(int64_t ref_full, uint32_t out_hi32)
 {
-    int64_t hi = (ref_full >> 8) + (int64_t)off_hi32;
+    uint32_t ref32 = (uint32_t)(ref_full >> 8);
+    int64_t  delta = (int64_t)(uint32_t)(out_hi32 - ref32);
+    int64_t  hi    = (ref_full >> 8) + delta;
 
     return (hi & ~1LL) << 8;
 }
@@ -213,9 +231,10 @@ static void run_frame(unsigned ti, int64_t poll_g, uint32_t sfn)
         poll_rx_full[s] = sim_local_dtu(&A[s].clk, poll_g + prop[s]);
         poll_rx_w[s]    = WIRE(poll_rx_full[s]);
 
-        resp_tx_full[s] = launch_full(poll_rx_full[s],
-                                      us_to_hi32(c->resp_base_us
-                                                 + s * c->resp_pitch_us));
+        /* Equation (1), evaluated by the firmware's own slot_resp_hi32(). */
+        resp_tx_full[s] = launch_from(
+            poll_rx_full[s],
+            slot_resp_hi32(c, (uint32_t)(poll_rx_full[s] >> 8), (uint8_t)s));
         resp_tx_w[s]    = WIRE(resp_tx_full[s]);
         resp_g[s]       = sim_global_from_local(&A[s].clk, resp_tx_full[s]);
 
@@ -246,17 +265,14 @@ static void run_frame(unsigned ti, int64_t poll_g, uint32_t sfn)
      * earlier slot's reception walks the Final straight into the slot of the
      * responder that was missed. Modelling it faithfully is what makes this
      * scenario collision-free. */
-    if (last == (int32_t)(nr - 1u))
-    {
-        final_tx_full = launch_full(resp_rx_full[last],
-                                    us_to_hi32(c->resp_pitch_us));
-    }
-    else
-    {
-        final_tx_full = launch_full(poll_tx_full,
-                                    us_to_hi32(c->resp_base_us
-                                               + nr * c->resp_pitch_us));
-    }
+    /* Equation (2) and its nominal fallback, both from the firmware's own
+     * slot_final_hi32(). The fallback is load-bearing: without it a responder
+     * whose Response the initiator missed still transmitted, and the Final
+     * walks into that responder's slot. */
+    final_tx_full = launch_from(
+        poll_tx_full,
+        slot_final_hi32(c, (uint32_t)(poll_tx_full >> 8),
+                        (uint32_t)(resp_rx_full[last] >> 8), last));
     final_tx_w    = WIRE(final_tx_full);
     final_g       = sim_global_from_local(&t->clk, final_tx_full);
 
@@ -286,9 +302,10 @@ static void run_frame(unsigned ti, int64_t poll_g, uint32_t sfn)
 
         tau = ranging_tof_dtu(&ts);
 
-        rep_full = launch_full(final_rx_full,
-                               us_to_hi32(c->report_base_us
-                                          + s * c->report_pitch_us));
+        /* Equation (3), evaluated by the firmware's own slot_report_hi32(). */
+        rep_full = launch_from(
+            final_rx_full,
+            slot_report_hi32(c, (uint32_t)(final_rx_full >> 8), (uint8_t)s));
         rep_g = sim_global_from_local(&A[s].clk, rep_full);
 
         tx_log(rep_g, rep_g + ns_to_dtu_g(timing_air_report_ns(c)),
@@ -349,6 +366,82 @@ static void run_frame(unsigned ti, int64_t poll_g, uint32_t sfn)
         }
         note_state(o, rx_g);
     }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Equivalence check: slots.c must reproduce, bit for bit, the expressions      */
+/* that used to sit inline in role_initiator.c and role_responder.c. This is    */
+/* what makes the refactor safe rather than merely plausible.                   */
+/* ------------------------------------------------------------------------- */
+static int check_slot_equivalence(const cfg_t *base)
+{
+    static const uint32_t refs[] = { 0u, 1u, 255u, 0x7FFFFFFFu, 0x80000000u,
+                                     0xFFFFFF00u, 0xFFFFFFFFu, 123456789u };
+    cfg_t c = *base;
+    int   bad = 0;
+    unsigned nr, ri, s;
+
+    for (nr = 2u; nr <= CFG_MAX_RESP; nr++)
+    {
+        c.resp_count = (uint8_t)nr;
+
+        for (ri = 0; ri < sizeof(refs) / sizeof(refs[0]); ri++)
+        {
+            uint32_t t = refs[ri];
+
+            /* Equation (1), as role_responder.c had it. */
+            for (s = 0; s < nr; s++)
+            {
+                uint32_t want = t + us_to_hi32(c.resp_base_us
+                                               + (uint32_t)s * c.resp_pitch_us);
+                if (slot_resp_hi32(&c, t, (uint8_t)s) != want) { bad++; }
+
+                /* Equation (3). */
+                want = t + us_to_hi32(c.report_base_us
+                                      + (uint32_t)s * c.report_pitch_us);
+                if (slot_report_hi32(&c, t, (uint8_t)s) != want) { bad++; }
+            }
+
+            /* Equation (2) and its nominal fallback. */
+            for (s = 0; s < nr; s++)
+            {
+                uint32_t want = (s == nr - 1u)
+                    ? (t + us_to_hi32(c.resp_pitch_us))
+                    : (t + us_to_hi32(c.resp_base_us
+                                      + (uint32_t)nr * c.resp_pitch_us));
+                if (slot_final_hi32(&c, t, t, (int32_t)s) != want) { bad++; }
+            }
+
+            /* The two receive windows and the exchange deadline. */
+            {
+                uint32_t want = t
+                    + us_to_hi32(c.resp_base_us
+                                 + (uint32_t)(nr - 1u) * c.resp_pitch_us)
+                    + ns_to_hi32(timing_air_resp_ns(&c))
+                    + us_to_hi32(c.guard_us / 2u);
+                if (slot_resp_window_end_hi32(&c, t) != want) { bad++; }
+
+                want = t
+                    + us_to_hi32(c.report_base_us
+                                 + (uint32_t)(nr - 1u) * c.report_pitch_us)
+                    + ns_to_hi32(timing_air_report_ns(&c))
+                    + us_to_hi32(c.guard_us / 2u);
+                if (slot_report_window_end_hi32(&c, t) != want) { bad++; }
+
+                want = t
+                    + us_to_hi32(c.resp_base_us
+                                 + (uint32_t)nr * c.resp_pitch_us
+                                 + c.rx_timeout_us)
+                    + ns_to_hi32(timing_air_final_ns(&c));
+                if (slot_exchange_deadline_hi32(&c, t) != want) { bad++; }
+            }
+        }
+    }
+
+    printf("slots.c matches the pre-refactor inline expressions: %s\n\n",
+           bad ? "NO" : "yes");
+    if (bad) { printf("  FAIL %d slot mismatches\n\n", bad); }
+    return bad ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -710,6 +803,7 @@ int main(void)
            base.frame_dur_us, timing_superframe_us(&base),
            1.0e6 / (double)timing_superframe_us(&base));
 
+    fail |= check_slot_equivalence(&base);
     fail |= scenario("IDEAL      static clocks, no loss", false, 0u,   &base);
     fail |= scenario("REALISTIC  thermal drift, 2% loss", true,  200u, &base);
 

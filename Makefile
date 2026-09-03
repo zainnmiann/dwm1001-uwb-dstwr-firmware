@@ -48,6 +48,7 @@ SRC_C := \
   src/app.c \
   src/cfg.c \
   src/timing.c \
+  src/slots.c \
   src/radio.c \
   src/ranging.c \
   src/sync.c \

@@ -18,6 +18,7 @@
 #include "proto.h"
 #include "radio.h"
 #include "ranging.h"
+#include "slots.h"
 #include "timing.h"
 #include "output.h"
 #include "serial.h"
@@ -300,11 +301,7 @@ static void run_frame(const cfg_t *c)
     /* One continuous receive across the group, re-armed after each frame.
      * Per-response delayed windows were measured to cost more SPI time than
      * T_proc allows at delta_r = 300 us. */
-    win_end = poll_hi32
-            + us_to_hi32(c->resp_base_us
-                         + (uint32_t)(c->resp_count - 1u) * c->resp_pitch_us)
-            + ns_to_hi32(timing_air_resp_ns(c))
-            + us_to_hi32(c->guard_us / 2u);
+    win_end = slot_resp_window_end_hi32(c, poll_hi32);
 
     for (;;)
     {
@@ -367,16 +364,10 @@ static void run_frame(const cfg_t *c)
             if (m_resp_mask & (1u << s)) { last = (int32_t)s; }
         }
 
-        if (last == (int32_t)(c->resp_count - 1u))
-        {
-            final_hi32 = (uint32_t)(m_resp_rx[last] >> 8) + us_to_hi32(c->resp_pitch_us);
-        }
-        else
-        {
-            final_hi32 = poll_hi32
-                       + us_to_hi32(c->resp_base_us
-                                    + (uint32_t)c->resp_count * c->resp_pitch_us);
-        }
+        final_hi32 = slot_final_hi32(c, poll_hi32,
+                                     (last >= 0)
+                                         ? (uint32_t)(m_resp_rx[last] >> 8) : 0u,
+                                     last);
     }
 
     proto_hdr(m_buf, m_seq++, c->pan_id, ADDR_BROADCAST, c->node_id,
@@ -405,11 +396,7 @@ static void run_frame(const cfg_t *c)
     /* --- RX_REPORT: the Report group ------------------------------------- */
     if (c->report_enable)
     {
-        win_end = final_hi32
-                + us_to_hi32(c->report_base_us
-                             + (uint32_t)(c->resp_count - 1u) * c->report_pitch_us)
-                + ns_to_hi32(timing_air_report_ns(c))
-                + us_to_hi32(c->guard_us / 2u);
+        win_end = slot_report_window_end_hi32(c, final_hi32);
 
         for (;;)
         {
