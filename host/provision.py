@@ -74,7 +74,7 @@ BOARDS = {
 # The price is paid in rate: T_f grows about 1226 us per anchor slot, whether
 # or not that slot is occupied.
 N_TAGS = 2
-N_ANCHORS = 8
+N_ANCHORS = 4
 
 # Hashed: identical on every node, or the network splits.
 #
@@ -167,24 +167,53 @@ def first_line(txt):
     return txt.splitlines()[0].strip() if txt.strip() else "(no reply)"
 
 
+def alive(reply):
+    """Is a board listening at this baud?
+
+    Any $-framed response proves it is. Requiring $OK specifically was wrong
+    twice over: at 921600 the reply itself arrives corrupted over this VCOM,
+    and a board whose line buffer holds junk answers a perfectly good command
+    with $ERR,1 -- alive, just annoyed.
+    """
+    return "$OK" in reply or "$ERR" in reply
+
+
+def clear_line(s):
+    """Flush whatever partial line the board is holding.
+
+    Probing at the wrong baud leaves the board's parser mid-line, so the next
+    clean command is appended to that garbage and rejected as unknown. A bare
+    CRLF terminates it and costs nothing when the buffer is already empty.
+    """
+    s.reset_input_buffer()
+    s.write(b"\r\n")
+    s.flush()
+    time.sleep(0.25)
+    s.reset_input_buffer()
+
+
 def open_talking(dev):
     """Return a port at a baud the board actually answers on.
 
-    A freshly flashed board is at 921600 and garbles its replies over this
-    VCOM, so the drop to 115200 is sent blind and then confirmed.
+    A freshly flashed or never-configured board sits at the section 8.1
+    default of 921600, which garbles its replies over this VCOM, so the drop
+    to 115200 is sent blind and then confirmed.
     """
     for baud in BAUDS:
         s = serial.Serial(dev, baud, timeout=0.3)
         time.sleep(0.35)
-        if "$OK" in send(s, "$RANGE,STOP", 0.7):
-            return s, baud
-        if baud == 921600:                    # blind: drop it and re-open
+        clear_line(s)
+        if alive(send(s, "$RANGE,STOP", 0.7)):
+            if baud == BAUDS[0]:
+                return s, baud
+            # Talking, but at a baud we cannot read reliably: move it.
             send(s, f"$SET,uart_baud,{BAUDS[0]}", 0.5)
             s.close()
             time.sleep(0.6)
             s = serial.Serial(dev, BAUDS[0], timeout=0.3)
             time.sleep(0.35)
-            if "$OK" in send(s, "$RANGE,STOP", 0.7):
+            clear_line(s)
+            if alive(send(s, "$RANGE,STOP", 0.7)):
                 return s, BAUDS[0]
         s.close()
     return None, None
@@ -226,8 +255,25 @@ def table_b(s):
 
 
 # --------------------------------------------------------------------------- #
+def out_of_network(role, index, n_tags, n_anch):
+    """True when this board's index falls outside the declared network.
+
+    cfg_validate() rejects slot_index >= resp_count, so shrinking N_ANCHORS
+    leaves higher-numbered anchors unprovisionable. Saying so plainly beats
+    letting them fail on a $SET with an error that looks like a real fault.
+    """
+    limit = n_tags if role == "INIT" else n_anch
+    return index >= limit
+
+
 def provision(dev, sn, label, role, index, n_tags, n_anch, dry):  # noqa: C901
     print(f"\n=== {label}  (SN {sn}, {dev}) ===")
+    if out_of_network(role, index, n_tags, n_anch):
+        kind = "frame" if role == "INIT" else "slot"
+        print(f"   SKIPPED: {kind} {index} is outside the declared network "
+              f"({n_tags} tags x {n_anch} anchors) -- raise "
+              f"{'N_TAGS' if role == 'INIT' else 'N_ANCHORS'} to include it")
+        return None
     if dry:
         print("   would set: role", role, "index", index,
               "| resp_count", n_anch, "init_count", n_tags)
@@ -400,8 +446,15 @@ def report_fleet(n_tags, n_anch):
 
     by_hash = {}
     stale = never = 0
+    n_net = sum(1 for v in BOARDS.values()
+                if not out_of_network(v[1], v[2], n_tags, n_anch))
     for sn, (label, _role, _idx) in sorted(BOARDS.items(),
                                            key=lambda kv: kv[1][0]):
+        role, idx = BOARDS[sn][1], BOARDS[sn][2]
+        if out_of_network(role, idx, n_tags, n_anch):
+            print(f"  {label:5s}  --        --                 "
+                  f"not in this network")
+            continue
         rec = st.get(sn)
         if not rec:
             print(f"  {label:5s}  --        --                 never provisioned")
@@ -422,7 +475,7 @@ def report_fleet(n_tags, n_anch):
     else:
         if by_hash:
             best = max(by_hash.items(), key=lambda kv: len(kv[1]))
-            print(f"  {len(best[1])} of {len(BOARDS)} agree on {best[0]}"
+            print(f"  {len(best[1])} of {n_net} agree on {best[0]}"
                   f" ({', '.join(best[1])})")
             for h, labels in by_hash.items():
                 if h != best[0]:

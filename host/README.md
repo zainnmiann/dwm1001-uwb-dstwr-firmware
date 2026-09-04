@@ -92,6 +92,11 @@ setup and re-applies it:
 Edit `N_TAGS`, `N_ANCHORS`, `BOARDS`, `TIMING` and `LOCAL` at the top rather
 than the code.
 
+A board whose index falls outside the declared network is reported `not in
+this network` and skipped, rather than failing on a `$SET` with an error that
+looks like a fault — `cfg_validate()` rejects `slot_index >= resp_count`, so
+shrinking `N_ANCHORS` leaves higher-numbered anchors unprovisionable.
+
 **Size the network for its final size, not for the boards you have yet.**
 `resp_count` and `init_count` are hashed, so raising them later means
 re-provisioning every board. `N_ANCHORS = 8` reserves eight slots even with
