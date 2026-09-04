@@ -60,9 +60,9 @@ BOARDS = {
     "760131626": ("ANC3", "RESP", 2),
     "760217925": ("ANC4", "RESP", 3),
     "760217915": ("ANC5", "RESP", 4),
-    # ANC6, ANC7, ANC8 not built yet. Slots 5-7 are already reserved by
-    # N_ANCHORS, so adding them later is a per-board job, not a fleet-wide
-    # re-provision.
+    "760217943": ("ANC6", "RESP", 5),
+    "760217956": ("ANC7", "RESP", 6),
+    "760217975": ("ANC8", "RESP", 7),
 }
 
 # The network is sized for its FINAL size, not for however many boards happen
@@ -74,7 +74,7 @@ BOARDS = {
 # The price is paid in rate: T_f grows about 1226 us per anchor slot, whether
 # or not that slot is occupied.
 N_TAGS = 2
-N_ANCHORS = 4
+N_ANCHORS = 8
 
 # Hashed: identical on every node, or the network splits.
 #
@@ -105,9 +105,16 @@ LOCAL = {
     # to absorb the worst-case return from the in-flight radio_rx(), which
     # nothing measures. At 200 us every Poll was late.
     "proc_poll_us":  1000,
-    # 2 tags x N anchors of CSV output overruns 115200 and truncates lines.
-    # Raise the ceiling instead (out_format BIN, or out_mask 1) to run at 1.
     "rate_div":         2,
+    # BIN, not CSV. A text record is ~57 bytes, so 8 anchors at 21 Hz costs
+    # 9.7 kB/s against the 11.5 kB/s that 115200 8N1 carries -- 84% sustained
+    # duty, at which the TX ring never fully drains between frame bursts. The
+    # tail of the last record of each frame was being dropped along with its
+    # CRLF, leaving the next frame's first record with nowhere to begin, so
+    # slots 7 and 0 vanished from every view and ANC1 looked dead. A binary
+    # record is 25 bytes: 4.3 kB/s, and tx_dropped measured 0 over 25 s
+    # afterwards. Decoded by host/dwm_bin.py.
+    "out_format":   "BIN",
     "uart_baud":   115200,
     "autostart":        1,
     # Decawave's canonical DWM1001 figure, and NOT CFG_ANT_DELAY_UNCAL, so
@@ -415,14 +422,26 @@ def main():
 
     if a.verify:
         for dev, sn in known:
-            verify_only(dev, sn, BOARDS[sn][0])
+            try:
+                verify_only(dev, sn, BOARDS[sn][0])
+            except (serial.SerialException, OSError) as e:
+                print(f"  {BOARDS[sn][0]:5s} SN {sn}: went away ({e})")
         report_fleet(n_tags, n_anch)
         return
     else:
         for dev, sn in known:
             label, role, index = BOARDS[sn]
-            provision(dev, sn, label, role, index,
-                      n_tags, n_anch, a.dry_run)
+            try:
+                provision(dev, sn, label, role, index,
+                          n_tags, n_anch, a.dry_run)
+            except (serial.SerialException, OSError) as e:
+                # A board unplugged or reset mid-run used to abort the whole
+                # pass, discarding the work already done on every other board.
+                # Report it and carry on; the state file records what did
+                # succeed, so a re-run only has to cover the rest.
+                print(f"   FAILED: {label} went away mid-provision ({e})")
+                print("   -- its configuration may be half-applied; re-run "
+                      "with it attached")
     if a.dry_run:
         report_fleet(n_tags, n_anch)
         return

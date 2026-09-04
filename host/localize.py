@@ -518,6 +518,12 @@ F_SS_FALLBACK, F_NLOS, F_RESP_LOST = 0x01, 0x02, 0x04
 F_REPORT_LOST, F_DESYNC, F_HASH_MISMATCH = 0x08, 0x10, 0x20
 
 _RNG_ACC = {}          # tag -> {"sfn": n, "anchors": [...], "device_us": us}
+# Text records this parser could not use. A truncated $RNG line was being
+# dropped in silence, which made a healthy anchor look dead: at 8 anchors the
+# CSV stream overran 115200 and cost the last record of each frame plus the
+# first of the next. Surfaced on uwb/status/<tag>. out_format BIN is the fix;
+# this counter is how you find out you need it.
+RNG_MALFORMED = {}
 
 
 def _flag_names(f):
@@ -536,6 +542,8 @@ def parse_rng(line, tag, tag_height, coords):
     Returns a reading when a superframe completes, else None."""
     m = RNG_RE.search(line)
     if not m:
+        if line.startswith("$RNG"):
+            RNG_MALFORMED[tag] = RNG_MALFORMED.get(tag, 0) + 1
         return None
     (sfn, frame, _tag_id, anchor_id, slot, d_mm, tof_ps,
      rxp, fpp, flags, dev_us) = m.groups()
@@ -770,6 +778,7 @@ def tag_thread(device, name, tag_height, stop, pub=None, rate=None,
                                 pub.emit(f"status/{name}", {
                                     "tag_label": name, "hz": round(hz, 2),
                                     "online": True,
+                                    "malformed": RNG_MALFORMED.get(name, 0),
                                     "host_time": round(rd["t"], 3)})
 
                 # --- rate watchdog ---

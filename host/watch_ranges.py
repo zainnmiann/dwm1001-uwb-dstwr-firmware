@@ -9,6 +9,7 @@ directly and is the quickest way to see whether the network is ranging.
 """
 import argparse, collections, statistics, sys, threading, time
 import serial
+import dwm_bin
 from dwm_ports import dwm_ports
 
 try:
@@ -26,6 +27,9 @@ LOCK = threading.Lock()
 PAIRS = collections.OrderedDict()   # (tag, anchor) -> deque of (t, mm, rxp)
 LOST = collections.Counter()
 FLAGS = collections.Counter()
+# Input this tool could not use. Counted and shown, never discarded quietly:
+# silently dropping truncated lines is what made a healthy anchor look dead.
+DISCARD = collections.Counter()
 
 
 def reader(dev, name, stop):
@@ -41,6 +45,9 @@ def reader(dev, name, stop):
             line, buf = buf.split("\n", 1)
             m = RNG_RE.search(line)
             if not m:
+                if line.startswith("$RNG"):       # truncated by UART overflow
+                    with LOCK:
+                        DISCARD[name] += 1
                 continue
             (_sfn, _fr, _tag, anch, slot, d_mm, tof_ps,
              rxp, _fpp, flags, _us) = m.groups()
@@ -59,6 +66,32 @@ def reader(dev, name, stop):
     s.close()
 
 
+def reader_bin(dev, name, stop):
+    """Decode the binary stream (out_format = BIN)."""
+    d = dwm_bin.Decoder()
+    try:
+        s = serial.Serial(dev, 115200, timeout=0.3)
+    except Exception as e:
+        print(f"  {name}: {e}", file=sys.stderr)
+        return
+    while not stop.is_set():
+        for r in d.feed(s.read(4096)):
+            label = ANCHOR_NAMES.get(r["anchor_id"], r["anchor_id"])
+            key = (name, label)
+            with LOCK:
+                for f in r["flag_names"]:
+                    FLAGS[f] += 1
+                if r["flags"] & 0x04:
+                    LOST[key] += 1
+                    PAIRS.setdefault(key, collections.deque(maxlen=WIN))
+                else:
+                    PAIRS.setdefault(key, collections.deque(maxlen=WIN)).append(
+                        (time.time(), int(round(r["range_m"] * 1000)), r["rssi"]))
+        with LOCK:
+            DISCARD[name] = d.lost()
+    s.close()
+
+
 def draw(t0):
     with LOCK:
         rows, now = [], time.time()
@@ -74,6 +107,7 @@ def draw(t0):
                 statistics.stdev(mm) / 10.0 if len(mm) > 1 else float("nan"),
                 statistics.mean(rx) if rx else float("nan")))
         flags = dict(FLAGS)
+        discard = {k: v for k, v in DISCARD.items() if v}
 
     print("\033[H\033[J", end="")
     print(f"  UWB DS-TWR live ranges          {now - t0:6.1f} s elapsed")
@@ -88,6 +122,10 @@ def draw(t0):
     if flags:
         print("\n  flags seen: " + ", ".join(f"{k}={v}" for k, v in
                                              sorted(flags.items())))
+    if discard:
+        print("  DISCARDED input: " + ", ".join(f"{k}={v}" for k, v in
+                                                sorted(discard.items()))
+              + "   <- output is being lost; check $STAT tx_dropped")
     print("\n  sd is the spread of one pair's own samples, not accuracy;"
           "\n  absolute distance needs the antenna-delay calibration (sect 13 step 1)."
           "\n  Ctrl-C to stop.")
@@ -107,9 +145,18 @@ def main():
     stop = threading.Event()
     for p in ports:
         name = NODE_NAMES.get(p.serial_number, p.serial_number[-4:])
-        print(f"  reading {name} on {p.device}")
-        threading.Thread(target=reader, args=(p.device, name, stop),
-                         daemon=True).start()
+        try:
+            probe = serial.Serial(p.device, 115200, timeout=0.3)
+            time.sleep(0.4)
+            head = probe.read(4096)
+            probe.close()
+        except Exception as e:
+            print(f"  {name}: {e}", file=sys.stderr)
+            continue
+        binary = dwm_bin.SYNC in head and b"$RNG" not in head
+        print(f"  reading {name} on {p.device}  ({'BIN' if binary else 'CSV'})")
+        threading.Thread(target=reader_bin if binary else reader,
+                         args=(p.device, name, stop), daemon=True).start()
     time.sleep(1.0)
 
     t0 = time.time()
