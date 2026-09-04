@@ -89,8 +89,16 @@ setup and re-applies it:
 ./provision.py              # provision every attached board
 ```
 
-Edit the `BOARDS`, `TIMING` and `LOCAL` tables at the top rather than the
-code.
+Edit `N_TAGS`, `N_ANCHORS`, `BOARDS`, `TIMING` and `LOCAL` at the top rather
+than the code.
+
+**Size the network for its final size, not for the boards you have yet.**
+`resp_count` and `init_count` are hashed, so raising them later means
+re-provisioning every board. `N_ANCHORS = 8` reserves eight slots even with
+five anchors built; the empty slots simply report `RESP_LOST` every frame,
+which costs frame time but breaks nothing, and adding anchor 6 later is then a
+per-board job rather than a fleet-wide redo. The price is rate: `T_f` grows
+about 1226 µs per slot whether or not it is occupied.
 
 **Boards do not need to be attached together.** `TIMING` is the hashed set, so
 every node must carry identical values or its Polls are rejected — but the

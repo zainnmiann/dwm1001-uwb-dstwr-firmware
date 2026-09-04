@@ -60,7 +60,21 @@ BOARDS = {
     "760131626": ("ANC3", "RESP", 2),
     "760217925": ("ANC4", "RESP", 3),
     "760217915": ("ANC5", "RESP", 4),
+    # ANC6, ANC7, ANC8 not built yet. Slots 5-7 are already reserved by
+    # N_ANCHORS, so adding them later is a per-board job, not a fleet-wide
+    # re-provision.
 }
+
+# The network is sized for its FINAL size, not for however many boards happen
+# to be built yet. resp_count and init_count are in cfg_hash(), so raising
+# them later means re-provisioning every single board -- sizing for the end
+# state up front avoids that entirely. A slot with no anchor in it yet simply
+# reports RESP_LOST on every frame, which costs frame time but breaks nothing.
+#
+# The price is paid in rate: T_f grows about 1226 us per anchor slot, whether
+# or not that slot is occupied.
+N_TAGS = 2
+N_ANCHORS = 8
 
 # Hashed: identical on every node, or the network splits.
 #
@@ -231,12 +245,15 @@ def provision(dev, sn, label, role, index, n_tags, n_anch, dry):  # noqa: C901
         send(s, "$RANGE,STOP", 0.5)
 
         # Identity and network size first; they gate the range checks below.
-        steps = [("role", role),
+        # The frame is opened wide FIRST. cfg_validate() checks equation (14)
+        # on every $SET, so a larger resp_count or slot pitch is rejected while
+        # frame_dur_us still holds a value sized for a smaller network -- which
+        # silently leaves the old resp_count in place.
+        steps = [("frame_dur_us", FRAME_WIDE),
+                 ("role", role),
                  ("init_count", n_tags),
                  ("resp_count", n_anch),
                  ("frame_index" if role == "INIT" else "slot_index", index)]
-        # Frame opened wide, then the pitches, then closed to the requirement.
-        steps += [("frame_dur_us", FRAME_WIDE)]
         steps += list(TIMING.items())
         steps += list(LOCAL.items())
 
@@ -271,11 +288,11 @@ def provision(dev, sn, label, role, index, n_tags, n_anch, dry):  # noqa: C901
         send(s, "$STAT,CLEAR", 0.3)
         send(s, "$RANGE,START", 0.3)
 
-        st = load_state()
-        st[sn] = {"label": label, "hash": h, "frame_dur_us": req,
-                  "fingerprint": fingerprint(n_tags, n_anch),
-                  "when": time.strftime("%Y-%m-%d %H:%M")}
-        save_state(st)
+        recorded = load_state()
+        recorded[sn] = {"label": label, "hash": h, "frame_dur_us": req,
+                        "fingerprint": fingerprint(n_tags, n_anch),
+                        "when": time.strftime("%Y-%m-%d %H:%M")}
+        save_state(recorded)
 
         print(f"   frame_dur_us = {req}   hash = {h}   {first_line(saved)}")
         eqs = " ".join(f"{k}:{v}" for k, v in sorted(st.items()))
@@ -342,9 +359,10 @@ def main():
         sn = normalise_sn(p.serial_number)
         (known if sn in BOARDS else unknown).append((p.device, sn))
 
-    n_tags = sum(1 for v in BOARDS.values() if v[1] == "INIT")
-    n_anch = sum(1 for v in BOARDS.values() if v[1] == "RESP")
-    print(f"  network as declared in BOARDS: {n_tags} tags x {n_anch} anchors")
+    n_tags, n_anch = N_TAGS, N_ANCHORS
+    built = sum(1 for v in BOARDS.values() if v[1] == "RESP")
+    print(f"  network sized for {n_tags} tags x {n_anch} anchors"
+          f"  ({built} anchor board(s) known)")
     print(f"  attached and known: {len(known)} of {len(BOARDS)}")
     for dev, sn in unknown:
         print(f"  SKIPPING unknown board SN {sn} ({dev}) -- add it to BOARDS")
