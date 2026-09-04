@@ -37,6 +37,7 @@ typedef struct
 #define RADIO_RX_FRAME      1
 #define RADIO_RX_TIMEOUT    0
 #define RADIO_RX_ERROR    (-1)
+#define RADIO_RX_PENDING    2   /**< armed, nothing has landed yet */
 
 #define RADIO_TX_OK         0
 #define RADIO_TX_LATE     (-1)
@@ -51,6 +52,15 @@ bool     radio_reconfigure(const cfg_t *c);
  *  smallest representable nonzero timeout -- dwt_setrxtimeout(0) disables
  *  the frame wait timeout entirely and would block forever. */
 int      radio_rx(radio_rx_t *rx, uint32_t timeout_us, bool delayed, uint32_t start_hi32);
+
+/** Arm the receiver and return immediately, so the caller can do other work
+ *  while the DW1000 receives. Returns false when @p delayed was requested and
+ *  @p start_hi32 has already passed. Collect with radio_rx_poll(). */
+bool     radio_rx_arm(uint32_t timeout_us, bool delayed, uint32_t start_hi32);
+
+/** Non-blocking collect for a receiver armed by radio_rx_arm(). Returns
+ *  RADIO_RX_PENDING until the DW1000 reports a frame, a timeout or an error. */
+int      radio_rx_poll(radio_rx_t *rx);
 
 /** Transmit at an exact device time. @p len includes the two FCS bytes. */
 int      radio_tx_at(const uint8_t *buf, uint16_t len, uint32_t tx_hi32);

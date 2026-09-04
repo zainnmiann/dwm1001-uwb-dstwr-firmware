@@ -69,6 +69,17 @@ static bool     m_hash_mismatch_seen;
 
 static sync_t   m_sync;
 
+/* A Poll overheard by the watch armed at the end of our own frame, held until
+ * the main loop has advanced the alarm. It cannot be applied where it is
+ * received: sync_on_poll() adopts the absolute instant eq (9) predicts, and
+ * the caller runs sync_advance() straight after run_frame(), which would then
+ * add a second superframe on top and walk the alarm a whole frame forward. */
+static bool     m_peer_pending;
+static uint32_t m_peer_rx_hi32;
+static uint8_t  m_peer_m;
+static uint16_t m_peer_sfn;
+static uint16_t m_peer_src;
+
 const sync_t *app_sync(void) { return &m_sync; }
 
 /* ------------------------------------------------------------------------- */
@@ -259,6 +270,79 @@ static void emit_ranges(const cfg_t *c, uint64_t poll_tx, uint64_t final_tx)
 
 /* ------------------------------------------------------------------------- */
 
+/* Fold in whatever the end-of-frame watch heard. Applied after the alarm has
+ * advanced, which is where the ARMED receive window's own Polls have always
+ * landed, so eq (9) adopts the same instant either way. */
+static void apply_peer_poll(const cfg_t *c)
+{
+    if (!m_peer_pending)
+    {
+        return;
+    }
+    m_peer_pending = false;
+
+    app_stats()->polls_rx++;
+    (void)sync_on_poll(&m_sync, c, m_peer_rx_hi32, m_peer_m, m_peer_sfn,
+                       m_peer_src != c->node_id);
+}
+
+/* Open the window for the next initiator's Poll, then emit this frame's range
+ * records while the DW1000 receives it. Arming first is the whole point: the
+ * emit costs ~688 us for eight records and eq (14) never budgeted for it, so
+ * doing it the other way round left the receiver armed inside the peer's
+ * preamble and frame slot 0 never heard frame slot 1. */
+static void watch_peer_and_emit(const cfg_t *c, uint32_t poll_hi32,
+                                uint64_t poll_tx, uint64_t final_tx)
+{
+    radio_rx_t rx;
+    bool       armed = false;
+    int        r;
+
+    /* Every initiator needs this, including the one in the last frame slot:
+     * the next initiator's Poll is always exactly one frame after ours, and
+     * for the last slot that simply wraps into the next superframe's slot 0.
+     * Only a sole initiator has no peer to watch for, and arming there would
+     * land on its own next Poll. */
+    if (c->init_count > 1u)
+    {
+        armed = radio_rx_arm(slot_peer_watch_us(c), true,
+                             slot_peer_watch_start_hi32(c, poll_hi32));
+    }
+
+    emit_ranges(c, poll_tx, final_tx);
+
+    if (!armed)
+    {
+        return;
+    }
+
+    do
+    {
+        r = radio_rx_poll(&rx);
+    }
+    while (r == RADIO_RX_PENDING);
+
+    if (r == RADIO_RX_FRAME)
+    {
+        uint8_t  m;
+        uint16_t sfn, src;
+        if (decode_poll(&rx, c, &m, &sfn, &src))
+        {
+            m_peer_rx_hi32 = (uint32_t)(rx.rx_ts >> 8);
+            m_peer_m       = m;
+            m_peer_sfn     = sfn;
+            m_peer_src     = src;
+            m_peer_pending = true;
+        }
+    }
+    else if (r == RADIO_RX_ERROR)
+    {
+        app_stats()->rx_errors++;
+    }
+
+    radio_idle();
+}
+
 static void run_frame(const cfg_t *c)
 {
     uint32_t prep_start_hi32 = radio_systime_hi32();
@@ -425,7 +509,7 @@ static void run_frame(const cfg_t *c)
     }
 
     radio_idle();
-    emit_ranges(c, poll_tx, final_tx);
+    watch_peer_and_emit(c, poll_hi32, poll_tx, final_tx);
     LEDS_INVERT(BSP_LED_0_MASK);
 }
 
@@ -436,6 +520,7 @@ void app_run_initiator(void)
     const cfg_t *c = cfg();
 
     sync_start(&m_sync, c);
+    m_peer_pending = false;
 
     out_linef("I,initiator,node=0x%04X,frame=%u,N_I=%u,N_R=%u,Tf=%luus,TF=%luus",
               c->node_id, c->frame_index, c->init_count, c->resp_count,
@@ -468,6 +553,7 @@ void app_run_initiator(void)
         if (app_take_resync())
         {
             sync_start(&m_sync, c);
+            m_peer_pending = false;
             was_ranging = true;
             continue;
         }
@@ -481,6 +567,7 @@ void app_run_initiator(void)
              * COLD and re-acquire from overheard Polls per section 6. */
             was_ranging = true;
             sync_start(&m_sync, c);
+            m_peer_pending = false;
             continue;
         }
 
@@ -526,6 +613,7 @@ void app_run_initiator(void)
         if (rem < -(int32_t)timing_superframe_us(c))
         {
             sync_start(&m_sync, c);
+            m_peer_pending = false;
             continue;
         }
 
@@ -542,6 +630,7 @@ void app_run_initiator(void)
                 run_frame(c);
             }
             sync_advance(&m_sync, c);
+            apply_peer_poll(c);
             continue;
         }
 

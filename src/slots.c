@@ -86,3 +86,21 @@ uint32_t slot_exchange_deadline_hi32(const cfg_t *c, uint32_t poll_rx_hi32)
                       + c->rx_timeout_us)
          + ns_to_hi32(timing_air_final_ns(c));
 }
+
+uint32_t slot_peer_watch_start_hi32(const cfg_t *c, uint32_t poll_hi32)
+{
+    /* The next initiator polls exactly one frame after we did -- eq (8) with
+     * lambda = 1 read in the other direction. */
+    return poll_hi32
+         + us_to_hi32(c->frame_dur_us)
+         - us_to_hi32(c->guard_us);
+}
+
+uint32_t slot_peer_watch_us(const cfg_t *c)
+{
+    /* Round the air time up, as timing.c does throughout: a window short by
+     * part of a microsecond can clip the very frame it exists to catch. */
+    uint32_t air_us = (timing_air_poll_ns(c) + 999u) / 1000u;
+
+    return 2u * c->guard_us + air_us;
+}

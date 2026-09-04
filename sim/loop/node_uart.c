@@ -40,19 +40,43 @@ bool uart_io_baud_supported(uint32_t baud)
     }
 }
 
+/* Bytes written since the parent last charged for them. The harness bills
+ * these as serialisation time, which is what makes the frame budget in the
+ * simulation as tight as it is on the target. */
+static uint32_t s_pending_bytes;
+
+uint32_t node_uart_take_bytes(void)
+{
+    uint32_t n = s_pending_bytes;
+
+    s_pending_bytes = 0;
+    return n;
+}
+
 void uart_io_write(const char *data, uint32_t len)
 {
+    s_pending_bytes += len;
     if (s_out) { (void)fwrite(data, 1, len, s_out); }
 }
 
 void uart_io_puts(const char *s)
 {
+    s_pending_bytes += (uint32_t)strlen(s);
     if (s_out) { (void)fputs(s, s_out); }
 }
 
 void uart_io_printf(const char *fmt, ...)
 {
     va_list ap;
+    int     n;
+
+    /* vsnprintf into nothing first: the byte count has to be charged even
+     * when the run is not capturing output, or timing would depend on
+     * whether anyone was listening. */
+    va_start(ap, fmt);
+    n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n > 0) { s_pending_bytes += (uint32_t)n; }
 
     if (!s_out) { return; }
     va_start(ap, fmt);

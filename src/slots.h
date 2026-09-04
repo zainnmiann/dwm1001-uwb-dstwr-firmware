@@ -58,4 +58,22 @@ uint32_t slot_report_window_end_hi32(const cfg_t *c, uint32_t final_hi32);
 /** When a responder gives up waiting for the Final of this exchange. */
 uint32_t slot_exchange_deadline_hi32(const cfg_t *c, uint32_t poll_rx_hi32);
 
+/**
+ * Start of the window in which to watch for the *next* initiator's Poll,
+ * measured from our own Poll instant.
+ *
+ * Section 6 has every initiator rearm eq (9) off any Poll it overhears, and
+ * the one it can always count on is its immediate successor, exactly one
+ * frame later -- for the last frame slot that wraps into the next
+ * superframe's slot 0. Listening for it whenever the frame's own work happens
+ * to finish is a race, because the range records still have to be written
+ * out, so this places the window explicitly and opens it a guard early so the
+ * receiver is live before the preamble arrives.
+ */
+uint32_t slot_peer_watch_start_hi32(const cfg_t *c, uint32_t poll_hi32);
+
+/** Length of that watch window: the guard opened early, the Poll's air time,
+ *  and one more guard for skew in the peer's own alarm. */
+uint32_t slot_peer_watch_us(const cfg_t *c);
+
 #endif /* SLOTS_H_ */

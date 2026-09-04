@@ -38,6 +38,16 @@ typedef struct
     uint32_t kind;
     uint32_t node;
     int64_t  until_dtu;     /* REQ_RX: give up at this local instant        */
+    /* REQ_RX: the instant the receiver actually opens. A delayed arm enables
+     * the DW1000 at a programmed time whatever the MCU is doing afterwards,
+     * so the parent cannot infer this from when the request arrives -- that
+     * is precisely the difference the end-of-frame peer watch depends on. */
+    int64_t  from_dtu;
+    /* Bytes handed to the UART since the last round trip. Serialising them
+     * costs real time on the target and the frame budget never allowed for
+     * it, so the parent charges it here rather than letting output look
+     * free. */
+    uint32_t uart_bytes;
     uint32_t hi32;          /* REQ_TX: the armed instant                   */
     uint16_t len;           /* REQ_TX: frame length, FCS included          */
     uint8_t  buf[IPC_MAX_FRAME];

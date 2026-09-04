@@ -164,7 +164,11 @@ def summarise(per, rounds):
         ss = sorted(set(p["sfn"]))
         lo, hi, step = tagspan.get(tag, (ss[0], ss[-1], 1))
         expected = (hi - lo) / step + 1
-        t_cut = (t[0] + SETTLE_S) if t else 0.0
+        # Only trim when there is enough capture left to describe: a 30 s run
+        # has no steady state to speak of, and returning nan for every pair
+        # would strip the column that matters most from short checks.
+        t_cut = (t[0] + SETTLE_S) if (t and (t[-1] - t[0]) > 3.0 * SETTLE_S) \
+            else (t[0] if t else 0.0)
         tst = [x for x in t if x >= t_cut]
         dst = [dd for x, dd in zip(t, d) if x >= t_cut]
         rows.append({

@@ -91,6 +91,22 @@ static cfg_t   g_base;
 static uint32_t g_sf, g_sf_limit = 400u;
 static uint32_t g_loss_x100;
 static uint32_t g_proc_us = 60u;
+/* The deployment's link. Serialising a byte costs 10 bits at 8N1, and the
+ * initiator writes N_ANCH binary records at the end of every frame -- about
+ * 688 us for eight, which eq (14) never budgeted for. Charging it is what
+ * makes the simulated frame as tight as the real one. */
+static uint32_t g_uart_baud = 115200u;
+/* How far ahead of the RMARKER the receiver must already be listening.
+ *
+ * Zero means only "you cannot timestamp an RMARKER you were not listening
+ * for", which is the weakest true statement and the default, so the bundled
+ * scenario keeps asserting exactly what it did before. Set it to the
+ * preamble length (128 symbols at ~1.0256 us = 131 us for the deployment's
+ * PHY) to model acquisition properly: the DW1000 locks onto the preamble, so
+ * a receiver armed after it began gets nothing. That is the setting under
+ * which an initiator arming its peer watch after writing its range records
+ * misses the peer entirely -- run --preamble-us=131 to see it. */
+static uint32_t g_preamble_us;
 static uint64_t g_rng = 0x2545F4914F6CDD1DULL;
 static uint32_t g_collisions, g_tx_late, g_txs;
 static uint32_t g_late_kind[4];   /* Poll, Resp, Final, Report */
@@ -209,15 +225,24 @@ static void air_retire(void)
     uint32_t j;
     unsigned i;
 
+    /* Retire on time, not on delivery. Waiting for every receiver to be
+     * handed a frame assumed every receiver eventually would -- but a node
+     * whose receiver came on after the preamble never takes it, so those
+     * entries pinned the table until it overflowed. The bound that actually
+     * holds is the slowest node's clock: once every node is past the frame's
+     * end plus the collision margin, nobody can be given it any more. */
+    int64_t oldest = g_now;
+
+    for (i = 0; i < N_NODES; i++)
+    {
+        if (g_n[i].alive && g_n[i].t_g < oldest) { oldest = g_n[i].t_g; }
+    }
+
     for (j = 0; j < MAX_AIR; j++)
     {
-        bool done = true;
-
         if (!g_air[j].used) { continue; }
-        /* Keep an entry while any receiver might still be handed it, and long
-         * enough for the collision test to see its neighbours. */
-        for (i = 0; i < N_NODES; i++) { if (!g_air[j].seen[i]) { done = false; } }
-        if (done && g_air[j].end_g + (int64_t)us_to_dtu(20000u) < g_now)
+
+        if (g_air[j].end_g + (int64_t)us_to_dtu(20000u) < oldest)
         {
             g_air[j].used = false;
         }
@@ -240,6 +265,18 @@ static bool next_frame_for(unsigned i, int64_t *when, int *which, int64_t *rmark
         prop = sim_prop_dtu(dist_mm(&g_n[i], &g_n[g_air[j].tx_node]));
         rm   = g_air[j].start_g + prop;
         done = rm + (g_air[j].end_g - g_air[j].start_g);
+
+        /* A receiver that came on after the preamble had already started does
+         * not get the frame. Without this the harness receives anything whose
+         * RMARKER lands before the window closes, no matter how late the
+         * receiver was actually armed -- so it could not model an arm that
+         * misses its slot, which is the whole failure mode the end-of-frame
+         * peer watch exists to prevent. The preamble precedes the RMARKER, so
+         * the receiver has to be on before it, not merely before the mark. */
+        if (rm - (int64_t)us_to_dtu(g_preamble_us) < g_n[i].rx_open_g)
+        {
+            continue;
+        }
 
         if (!found || done < *when)
         {
@@ -362,6 +399,15 @@ static void pump(node_t *n)
             return;
         }
 
+        /* Bill the UART time before servicing the request: the bytes were
+         * written before the child got here. */
+        if (rq.uart_bytes && g_uart_baud)
+        {
+            uint64_t us = ((uint64_t)rq.uart_bytes * 10ULL * 1000000ULL)
+                        / (uint64_t)g_uart_baud;
+            n->t_g += (int64_t)us_to_dtu((uint32_t)us);
+        }
+
         switch (rq.kind)
         {
             case REQ_TX:
@@ -378,7 +424,13 @@ static void pump(node_t *n)
                        / DTU_PER_NS / 1e6);
                 n->park       = P_RX;
                 n->rx_until_g = sim_global_from_local(&n->clk, rq.until_dtu);
-                n->rx_open_g  = n->t_g;   /* receiver enabled from here */
+                /* A delayed arm opens the receiver at its programmed instant,
+                 * not when the child finally asked -- the child may have been
+                 * busy emitting in between, which is the whole point of
+                 * arming before the emit rather than after it. */
+                n->rx_open_g  = rq.from_dtu
+                                ? sim_global_from_local(&n->clk, rq.from_dtu)
+                                : n->t_g;
                 break;
             case REQ_TXWAIT: n->park = P_TXWAIT; break;
             case REQ_DONE:   n->alive = false; break;
@@ -508,6 +560,10 @@ static double   g_err_max[N_TAGS][N_ANCH];
 static double   g_err_sum[N_TAGS][N_ANCH];
 static uint32_t g_flag_resp_lost[N_TAGS][N_ANCH];
 static uint32_t g_zero_anchor;
+/* Frame sync is the point of the multi-initiator harness, so count what
+ * the nodes themselves report about it rather than inferring it. */
+static uint32_t g_desync[N_TAGS];
+static uint32_t g_records[N_TAGS];
 
 /* The run is cut off mid-superframe, so the highest sfn a tag emitted is
  * partial: the early slots got a range and the late ones did not. Counting it
@@ -547,6 +603,9 @@ static void parse_output(void)
             }
             if ((uint32_t)sfn >= g_max_sfn[t]) { continue; }   /* partial */
             if (anch == 0u) { g_zero_anchor++; }
+
+            g_records[t]++;
+            if (flags & RNG_FLAG_DESYNC) { g_desync[t]++; }
 
             if (flags & RNG_FLAG_RESP_LOST)
             {
@@ -690,6 +749,33 @@ static int report(void)
     printf("\n  superframes %u   transmissions %u   collisions %u   tx_late %u\n",
            g_sf, g_txs, g_collisions, g_tx_late);
 
+    /* Every initiator should hold a mutual lock. The node in frame slot 0 is
+     * the one that used to fail: its only chance to overhear a peer is the
+     * slot straight after its own frame, and listening for it whenever the
+     * frame's work happened to end was a race it lost. */
+    {
+        unsigned tt;
+
+        printf("\n  frame sync per initiator\n");
+        for (tt = 0; tt < N_TAGS; tt++)
+        {
+            printf("    tag %u  frame slot %u  %7u records  desync %6u  (%.2f%%)\n",
+                   tt, tt, g_records[tt], g_desync[tt],
+                   g_records[tt] ? 100.0 * (double)g_desync[tt] / (double)g_records[tt]
+                                 : 0.0);
+        }
+        for (tt = 0; tt < N_TAGS; tt++)
+        {
+            if (g_records[tt] && g_desync[tt] * 100u > g_records[tt] * 5u)
+            {
+                printf("    FAIL tag %u free-ran on %.1f%% of its records: "
+                       "it is not hearing its peers\n", tt,
+                       100.0 * (double)g_desync[tt] / (double)g_records[tt]);
+                fail = 1;
+            }
+        }
+    }
+
     if (g_collisions)
     {
         printf("    FAIL %u slot collisions\n", g_collisions);
@@ -727,6 +813,8 @@ int main(int argc, char **argv)
         if      (!strncmp(argv[i], "--superframes=", 14)) { g_sf_limit  = (uint32_t)atoi(argv[i]+14); }
         else if (!strncmp(argv[i], "--loss=",         7)) { g_loss_x100 = (uint32_t)(atof(argv[i]+7)*100.0); }
         else if (!strncmp(argv[i], "--proc-us=",     10)) { g_proc_us   = (uint32_t)atoi(argv[i]+10); }
+        else if (!strncmp(argv[i], "--uart-baud=",   12)) { g_uart_baud = (uint32_t)atoi(argv[i]+12); }
+        else if (!strncmp(argv[i], "--preamble-us=", 14)) { g_preamble_us = (uint32_t)atoi(argv[i]+14); }
     }
 
     cfg_defaults(&g_base);

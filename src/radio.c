@@ -360,42 +360,59 @@ static uint64_t read_rx_ts(void)
     return v;
 }
 
-int radio_rx(radio_rx_t *rx, uint32_t timeout_us, bool delayed, uint32_t start_hi32)
+/* dwt_setrxtimeout(0) disables the frame-wait timeout in the driver
+ * (SYS_CFG.RXWTOE cleared), which blocks forever rather than timing out.
+ * A genuine zero-length window should be treated as "expired immediately",
+ * not "wait forever" -- so any caller-requested timeout that rounds down
+ * to zero uus is bumped to the smallest representable nonzero timeout
+ * instead. Callers that truly want no timeout must not be on this path;
+ * none in this codebase do. */
+static void rx_set_timeout(uint32_t timeout_us)
 {
-    uint32_t status;
-    uint16_t frame_len;
     uint32_t uus = us_to_uus(timeout_us);
 
-    /* dwt_setrxtimeout(0) disables the frame-wait timeout in the driver
-     * (SYS_CFG.RXWTOE cleared), which blocks forever rather than timing out.
-     * A genuine zero-length window should be treated as "expired immediately",
-     * not "wait forever" -- so any caller-requested timeout that rounds down
-     * to zero uus is bumped to the smallest representable nonzero timeout
-     * instead. Callers that truly want no timeout must not be on this path;
-     * none in this codebase do. */
     if (timeout_us > 0u && uus == 0u) { uus = 1u; }
     if (uus > 65535u) { uus = 65535u; }
     dwt_setrxtimeout((uint16_t)uus);
+}
+
+/* Arming and collecting are separated so a caller can do useful work while the
+ * DW1000 receives. The initiator needs exactly that: it must open the window
+ * for the next initiator's Poll *before* spending ~688 us writing its eight
+ * range records to the UART, because eq (14) sizes the frame from air time,
+ * slot pitches and guard and never accounted for that output. With the two
+ * fused together the write had to finish first, which left the receiver armed
+ * within ~200 us of the peer's preamble -- and the node in frame slot 0 lost
+ * that race on all but 7 of 12690 frames, then free-ran and stamped
+ * RNG_FLAG_DESYNC on everything it emitted. */
+bool radio_rx_arm(uint32_t timeout_us, bool delayed, uint32_t start_hi32)
+{
+    rx_set_timeout(timeout_us);
 
     if (delayed)
     {
         dwt_setdelayedtrxtime(start_hi32);
         if (dwt_rxenable(DWT_START_RX_DELAYED | DWT_IDLE_ON_DLY_ERR) != DWT_SUCCESS)
         {
-            return RADIO_RX_TIMEOUT;    /* start instant already passed */
+            return false;               /* start instant already passed */
         }
-    }
-    else
-    {
-        (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+        return true;
     }
 
-    do
+    (void)dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    return true;
+}
+
+int radio_rx_poll(radio_rx_t *rx)
+{
+    uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
+    uint16_t frame_len;
+
+    if ((status & (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO |
+                   SYS_STATUS_ALL_RX_ERR)) == 0)
     {
-        status = dwt_read32bitreg(SYS_STATUS_ID);
+        return RADIO_RX_PENDING;
     }
-    while ((status & (SYS_STATUS_RXFCG | SYS_STATUS_ALL_RX_TO |
-                      SYS_STATUS_ALL_RX_ERR)) == 0);
 
     rx->status = status;
 
@@ -426,6 +443,24 @@ int radio_rx(radio_rx_t *rx, uint32_t timeout_us, bool delayed, uint32_t start_h
     dwt_write32bitreg(SYS_STATUS_ID, SYS_STATUS_ALL_RX_ERR);
     dwt_rxreset();
     return RADIO_RX_ERROR;
+}
+
+int radio_rx(radio_rx_t *rx, uint32_t timeout_us, bool delayed, uint32_t start_hi32)
+{
+    int r;
+
+    if (!radio_rx_arm(timeout_us, delayed, start_hi32))
+    {
+        return RADIO_RX_TIMEOUT;        /* start instant already passed */
+    }
+
+    do
+    {
+        r = radio_rx_poll(rx);
+    }
+    while (r == RADIO_RX_PENDING);
+
+    return r;
 }
 
 

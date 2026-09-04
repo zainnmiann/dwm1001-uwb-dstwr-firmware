@@ -75,8 +75,18 @@ def main():
         # useless for spotting the one that matters.
         nbytes = os.path.getsize(binpath)
         loss_pct = 100.0 * dec.lost() / max(1, nbytes)
-        good = agree and loss_pct <= 0.01 and (
-            yield_pct is None or yield_pct >= 99.0)
+
+        # The bracket reads $CFG/$STAT with ranging stopped and restarted, so
+        # the firmware counts a second or two of ranges the read loop was never
+        # open for. Expressed as seconds that shortfall is constant, while as a
+        # percentage it grows as the capture shortens -- so judge it in seconds
+        # and a 30 s check stops crying wolf while a truncated 600 s one still
+        # fails loudly.
+        secs = meta.get("actual_secs") or 0
+        rate = (n_json / secs) if secs else 0
+        short_s = ((fw - n_json) / rate) if (fw and rate) else 0
+
+        good = agree and loss_pct <= 0.01 and abs(short_s) <= 6.0
         ok = ok and good
 
         print(f"  {tag}: bin re-decode {n_bin:,}  jsonl {n_json:,}  "
@@ -85,7 +95,8 @@ def main():
               f"({dec.lost()} B lost of {nbytes:,} = {loss_pct:.4f}%)")
         if fw:
             print(f"        firmware counted {fw:,} ranges -> "
-                  f"{yield_pct:.2f}% captured")
+                  f"{yield_pct:.2f}% captured, "
+                  f"{short_s:+.1f} s of ranging unaccounted for")
         if meta.get("stalled"):
             print(f"        stream stalled at {meta.get('stall_at_s')}s")
         print(f"        {'OK' if good else 'SUSPECT'}")

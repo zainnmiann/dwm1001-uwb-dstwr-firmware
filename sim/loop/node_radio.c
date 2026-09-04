@@ -28,9 +28,17 @@ static uint32_t         s_part_id;
 
 void node_radio_set_part_id(uint32_t id) { s_part_id = id; }
 
+uint32_t node_uart_take_bytes(void);
+
 static void trip(const ipc_req_t *rq, ipc_rep_t *rp)
 {
-    ipc_round_trip(rq, rp);
+    ipc_req_t q = *rq;
+
+    /* Hand over the UART bytes written since we last spoke so the parent can
+     * bill the serialisation time against this node's clock. */
+    q.uart_bytes = node_uart_take_bytes();
+
+    ipc_round_trip(&q, rp);
     s_now_dtu = rp->now_dtu;
 }
 
@@ -96,33 +104,102 @@ void radio_idle(void)
 }
 
 /* --- receive -------------------------------------------------------------- */
-int radio_rx(radio_rx_t *rx, uint32_t timeout_us, bool delayed, uint32_t start_hi32)
+
+/* Lift a 32-bit hi32 onto the running 40-bit timeline, nearest wrap to now.
+ *
+ * The low 8 bits belong to the dtu below hi32's resolution and must come from
+ * the hi32 value itself, shifted -- not from now_dtu. Carrying now's low bits
+ * across leaves up to 255 dtu (~2.0 ns, 0.6 m of range) of error, which is
+ * exactly the bug that made an earlier harness disagree with the target. */
+static int64_t lift_hi32(uint32_t hi32)
+{
+    int64_t  base = s_now_dtu >> 8;
+    int64_t  out  = (int64_t)hi32;
+    int64_t  span = 1LL << 32;
+
+    while (out - base >  (span / 2)) { out -= span; }
+    while (base - out >  (span / 2)) { out += span; }
+
+    return out << 8;
+}
+
+/* An armed-but-not-collected receiver. The harness has no concurrency, so the
+ * window is remembered here and the round trip happens in radio_rx_poll();
+ * the parent still sees the same absolute interval either way, which is what
+ * decides whether the frame is inside it. */
+static bool    s_armed;
+static int64_t s_arm_from_dtu;
+static int64_t s_arm_until_dtu;
+
+bool radio_rx_arm(uint32_t timeout_us, bool delayed, uint32_t start_hi32)
+{
+    /* Zero means "open when the parent services the request". An immediate
+     * arm must not carry this child's own timestamp: that reading is stale by
+     * whatever the parent is about to charge for UART output, and sending it
+     * would hand back exactly the time the emit was supposed to cost. */
+    int64_t from = delayed ? lift_hi32(start_hi32) : 0;
+
+    /* radio.c returns false when a delayed start has already passed, because
+     * dwt_rxenable() rejects it -- the harness must refuse it identically or
+     * the caller's fallback path never gets exercised. */
+    if (delayed && from < s_now_dtu)
+    {
+        return false;               /* dwt_rxenable() would reject it too */
+    }
+
+    s_armed         = true;
+    s_arm_from_dtu  = from;
+    s_arm_until_dtu = (delayed ? from : s_now_dtu)
+                    + (int64_t)us_to_dtu(timeout_us ? timeout_us : 1u);
+    return true;
+}
+
+int radio_rx_poll(radio_rx_t *rx)
 {
     ipc_req_t rq;
     ipc_rep_t rp;
 
-    /* The role loops only ever use the immediate form. */
-    (void)delayed;
-    (void)start_hi32;
+    if (!s_armed)
+    {
+        return RADIO_RX_TIMEOUT;
+    }
+    s_armed = false;
 
     memset(&rq, 0, sizeof(rq));
     rq.kind      = REQ_RX;
-    rq.until_dtu = s_now_dtu + (int64_t)us_to_dtu(timeout_us ? timeout_us : 1u);
+    rq.until_dtu = s_arm_until_dtu;
+    rq.from_dtu  = s_arm_from_dtu;
 
     trip(&rq, &rp);
 
     if (rp.kind != REP_FRAME) { return RADIO_RX_TIMEOUT; }
+
+    /* A frame that landed before the window opened was not received by a
+     * delayed arm, however convenient the parent's bookkeeping makes it. */
+    if ((int64_t)rp.rx_ts < s_arm_from_dtu)
+    {
+        return RADIO_RX_TIMEOUT;
+    }
 
     memset(rx, 0, sizeof(*rx));
     rx->len   = rp.len;
     rx->rx_ts = rp.rx_ts;
     memcpy(rx->buf, rp.buf, rp.len);
 
-    s_carrier         = rp.carrier_int;
+    s_carrier          = rp.carrier_int;
     s_quality.rx_dbm10 = rp.rx_dbm10;
     s_quality.fp_dbm10 = rp.fp_dbm10;
 
     return RADIO_RX_FRAME;
+}
+
+int radio_rx(radio_rx_t *rx, uint32_t timeout_us, bool delayed, uint32_t start_hi32)
+{
+    if (!radio_rx_arm(timeout_us, delayed, start_hi32))
+    {
+        return RADIO_RX_TIMEOUT;
+    }
+    return radio_rx_poll(rx);
 }
 
 int32_t radio_carrier_integrator(void) { return s_carrier; }
