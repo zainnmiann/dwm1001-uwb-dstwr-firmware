@@ -90,9 +90,33 @@ setup and re-applies it:
 ```
 
 Edit the `BOARDS`, `TIMING` and `LOCAL` tables at the top rather than the
-code. `TIMING` is the hashed set -- every node must carry identical values or
-its Polls are rejected -- so **all boards have to be attached together**; the
-script compares the hash across them at the end and says so if they diverge.
+code.
+
+**Boards do not need to be attached together.** `TIMING` is the hashed set, so
+every node must carry identical values or its Polls are rejected — but the
+script applies the same values on every run, so provisioning one board at a
+time reaches the same result. `frame_dur_us` included: it is derived from
+`$TABLEB`, which computes it purely from the hashed parameters, so each board
+independently arrives at the same number.
+
+Each board's hash is recorded in `.provision_state.json`, so agreement is
+judged across runs rather than within one, and the record survives coming back
+a day later. The closing report covers the whole declared fleet:
+
+```
+  board  hash      provisioned        state
+  ANC1   0xBBBB    2026-09-03 14:52   STALE (older settings)
+  ANC2   --        --                 never provisioned
+  TAG1   0xAAAA    2026-09-04 10:00   current
+
+  2 of 7 agree on 0xAAAA (TAG1, TAG2)
+  DIFFERENT HASH 0xCCCC: ANC2 -- these are not in the same network
+```
+
+`STALE` and `DIFFERENT HASH` are deliberately separate: a board provisioned
+correctly against an older `TIMING` table and one that genuinely disagrees
+both look like a mismatch by hash alone, but only the first tells you which
+boards need redoing. `--forget` clears the record.
 
 The timing there is not the specification's default. Its own values (`T_r0`
 400, `dr` 300, `T_p0` 400) proved too aggressive for real DW1000 SPI at 8 MHz:

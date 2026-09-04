@@ -7,7 +7,15 @@ setup is, and re-applies it.
 
     ./provision.py --dry-run     show what would be sent, touch nothing
     ./provision.py               provision every attached board in BOARDS
-    ./provision.py --verify      only report current state and hashes
+    ./provision.py --verify      report each board's live state, change nothing
+    ./provision.py --forget      clear the recorded provisioning state
+
+Boards do not need to be attached together. The values applied are identical
+every run, so provisioning them ONE AT A TIME reaches the same result --
+frame_dur_us included, since it is derived from $TABLEB, which computes it
+purely from the hashed parameters. Each board's hash is recorded in
+.provision_state.json, so agreement is judged across runs rather than within
+one, and the record survives coming back a day later.
 
 Three things it has to get right, all learned the hard way:
 
@@ -23,9 +31,13 @@ Three things it has to get right, all learned the hard way:
   * The hash. resp_base_us, resp_pitch_us, report_base_us, report_pitch_us,
     frame_dur_us, resp_count and init_count are all in cfg_hash(), so every
     node must carry identical values or its Polls are rejected by the others.
-    The script ends by comparing the hash across all boards.
+    The script records each board's hash and reports agreement across the
+    whole declared fleet, not just the boards attached to this run.
 """
 import argparse
+import hashlib
+import json
+import os
 import sys
 import time
 
@@ -46,6 +58,8 @@ BOARDS = {
     "760131573": ("ANC1", "RESP", 0),
     "760131584": ("ANC2", "RESP", 1),
     "760131626": ("ANC3", "RESP", 2),
+    "760217925": ("ANC4", "RESP", 3),
+    "760217915": ("ANC5", "RESP", 4),
 }
 
 # Hashed: identical on every node, or the network splits.
@@ -92,6 +106,38 @@ LOCAL = {
 
 FRAME_WIDE = 20000     # opened this wide while the pitches are set
 BAUDS = (115200, 921600)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+STATE = os.path.join(HERE, ".provision_state.json")
+
+
+def fingerprint(n_tags, n_anch):
+    """Identify the settings a board was provisioned against.
+
+    Hashes alone cannot separate a board that genuinely disagrees from one
+    provisioned correctly against an OLDER TIMING table -- both read as a
+    mismatch, but only the second tells you which boards need redoing. This
+    makes staleness distinguishable from disagreement.
+    """
+    src = json.dumps({"timing": TIMING, "n_tags": n_tags, "n_anch": n_anch},
+                     sort_keys=True)
+    return hashlib.sha256(src.encode()).hexdigest()[:12]
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1, sort_keys=True)
+    os.replace(tmp, STATE)          # atomic, so an interrupted run cannot
+                                    # leave a half-written record
 
 
 # --------------------------------------------------------------------------- #
@@ -166,7 +212,7 @@ def table_b(s):
 
 
 # --------------------------------------------------------------------------- #
-def provision(dev, sn, label, role, index, n_tags, n_anch, dry):
+def provision(dev, sn, label, role, index, n_tags, n_anch, dry):  # noqa: C901
     print(f"\n=== {label}  (SN {sn}, {dev}) ===")
     if dry:
         print("   would set: role", role, "index", index,
@@ -225,6 +271,12 @@ def provision(dev, sn, label, role, index, n_tags, n_anch, dry):
         send(s, "$STAT,CLEAR", 0.3)
         send(s, "$RANGE,START", 0.3)
 
+        st = load_state()
+        st[sn] = {"label": label, "hash": h, "frame_dur_us": req,
+                  "fingerprint": fingerprint(n_tags, n_anch),
+                  "when": time.strftime("%Y-%m-%d %H:%M")}
+        save_state(st)
+
         print(f"   frame_dur_us = {req}   hash = {h}   {first_line(saved)}")
         eqs = " ".join(f"{k}:{v}" for k, v in sorted(st.items()))
         print(f"   {eqs}")
@@ -269,7 +321,17 @@ def main():
                     help="print what would be sent, change nothing")
     ap.add_argument("--verify", action="store_true",
                     help="report current state and hashes, change nothing")
+    ap.add_argument("--forget", action="store_true",
+                    help="clear the recorded provisioning state and exit")
     a = ap.parse_args()
+
+    if a.forget:
+        try:
+            os.remove(STATE)
+            print(f"  cleared {STATE}")
+        except FileNotFoundError:
+            print("  nothing recorded")
+        return
 
     ports = dwm_ports()
     if not ports:
@@ -288,30 +350,72 @@ def main():
         print(f"  SKIPPING unknown board SN {sn} ({dev}) -- add it to BOARDS")
 
     if a.verify:
-        hashes = [verify_only(dev, sn, BOARDS[sn][0]) for dev, sn in known]
+        for dev, sn in known:
+            verify_only(dev, sn, BOARDS[sn][0])
+        report_fleet(n_tags, n_anch)
+        return
     else:
-        hashes = []
         for dev, sn in known:
             label, role, index = BOARDS[sn]
-            hashes.append(provision(dev, sn, label, role, index,
-                                    n_tags, n_anch, a.dry_run))
+            provision(dev, sn, label, role, index,
+                      n_tags, n_anch, a.dry_run)
     if a.dry_run:
+        report_fleet(n_tags, n_anch)
         return
 
-    hs = {h for h in hashes if h}
-    print()
-    if len(hs) == 1:
-        print(f"  config hash identical across {len(hs and hashes)} boards: "
-              f"{hs.pop()}")
-    else:
-        print(f"  HASH MISMATCH {hs} -- nodes with different hashes ignore "
-              f"each other's Polls")
-        print("  every board must be attached and provisioned together")
+    report_fleet(n_tags, n_anch)
 
-    missing = len(BOARDS) - len(known)
-    if missing:
-        print(f"  {missing} declared board(s) were not attached and still "
-              f"carry their old configuration")
+
+def report_fleet(n_tags, n_anch):
+    """Report every declared board, from the state file.
+
+    Provisioning one board at a time is the normal case here -- not every
+    board can be attached at once -- so agreement has to be judged across
+    runs rather than within one. The state file is what makes that possible,
+    and it survives coming back a day later.
+    """
+    st = load_state()
+    want = fingerprint(n_tags, n_anch)
+    print()
+    print("  board  hash      provisioned        state")
+    print("  " + "-" * 52)
+
+    by_hash = {}
+    stale = never = 0
+    for sn, (label, _role, _idx) in sorted(BOARDS.items(),
+                                           key=lambda kv: kv[1][0]):
+        rec = st.get(sn)
+        if not rec:
+            print(f"  {label:5s}  --        --                 never provisioned")
+            never += 1
+            continue
+        if rec.get("fingerprint") != want:
+            note = "STALE (older settings)"
+            stale += 1
+        else:
+            note = "current"
+            by_hash.setdefault(rec["hash"], []).append(label)
+        print(f"  {label:5s}  {rec['hash']:8s}  {rec['when']:17s}  {note}")
+
+    print()
+    if len(by_hash) == 1 and not stale and not never:
+        h, labels = next(iter(by_hash.items()))
+        print(f"  fleet agrees: all {len(labels)} boards on {h}")
+    else:
+        if by_hash:
+            best = max(by_hash.items(), key=lambda kv: len(kv[1]))
+            print(f"  {len(best[1])} of {len(BOARDS)} agree on {best[0]}"
+                  f" ({', '.join(best[1])})")
+            for h, labels in by_hash.items():
+                if h != best[0]:
+                    print(f"  DIFFERENT HASH {h}: {', '.join(labels)}"
+                          f" -- these are not in the same network")
+        todo = stale + never
+        if todo:
+            print(f"  {todo} board(s) still to provision"
+                  f"{' (' + str(stale) + ' stale)' if stale else ''}")
+        print("  attach each remaining board and re-run; the values applied are"
+              " identical, so order does not matter")
 
 
 if __name__ == "__main__":

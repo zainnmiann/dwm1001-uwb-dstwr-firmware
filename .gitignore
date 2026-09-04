@@ -17,3 +17,4 @@ test/test_host
 sim/sim
 sim/loop/harness
 sim/ui/viewer.html
+host/.provision_state.json
