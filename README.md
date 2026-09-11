@@ -220,7 +220,11 @@ make erase            # required when coming from factory PANS firmware
 ```
 
 Current image: ~39 kB flash, ~7 kB RAM. Configuration occupies 708 B of the last
-flash page.
+flash page, so it survives a reflash.
+
+Selecting one board out of several, coming from the factory PANS image, and
+talking to a board over serial by hand are covered in
+[FLASHING_AND_CALIBRATION.md](FLASHING_AND_CALIBRATION.md).
 
 ---
 
@@ -287,7 +291,9 @@ matter here.
 
 1. Lock the PHY configuration; calibrate `delta_A` and `delta_B_s` at a surveyed
    baseline (`ant_delay_tx` / `ant_delay_rx`, and the per-responder `ant` trim in
-   the anchor list).
+   the anchor list). Step-by-step, with the arithmetic and the units:
+   [FLASHING_AND_CALIBRATION.md &sect;4](FLASHING_AND_CALIBRATION.md#4-calibrating-the-antenna-delay).
+   Not yet done on this fleet — every board carries the generic 16436.
 2. Verify the §12 facilities on two nodes — already present in the driver, so
    this reduces to confirming delayed TX/RX behave.
 3. One initiator, one responder. Record bias and standard deviation vs distance.
