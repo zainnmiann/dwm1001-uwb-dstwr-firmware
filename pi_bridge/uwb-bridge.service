@@ -1,0 +1,17 @@
+[Unit]
+Description=DWM1001 UWB range bridge to MQTT
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/bin/python3 /opt/uwb/uwb_bridge.py
+EnvironmentFile=/etc/default/uwb-bridge
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
